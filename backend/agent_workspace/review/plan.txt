@@ -1,0 +1,6 @@
+AI Agent Oversight Workbench
+
+Project Plan:
+1. Build an approval system.
+2. Connect the backend.
+3. Store decisions in SQLite.

@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from executor import execute_file_action
+
 
 app = FastAPI(
     title="AI Agent Oversight Workbench",
@@ -46,11 +48,10 @@ def get_db_connection():
         connection.close()
 
 
-# Create database tables and insert sample actions if needed.
+# Create database tables and update existing database columns.
 def initialize_database():
     with get_db_connection() as connection:
 
-        # Actions table
         connection.execute("""
             CREATE TABLE IF NOT EXISTS actions (
                 id INTEGER PRIMARY KEY,
@@ -63,7 +64,33 @@ def initialize_database():
             )
         """)
 
-        # Audit log table
+        # Add execution columns to existing databases when needed.
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(actions)"
+            ).fetchall()
+        }
+
+        if "execution_status" not in columns:
+            connection.execute("""
+                ALTER TABLE actions
+                ADD COLUMN execution_status TEXT NOT NULL
+                DEFAULT 'not_started'
+                CHECK (
+                    execution_status IN (
+                        'not_started', 'running', 'completed', 'failed'
+                    )
+                )
+            """)
+
+        if "execution_message" not in columns:
+            connection.execute("""
+                ALTER TABLE actions
+                ADD COLUMN execution_message TEXT NOT NULL DEFAULT ''
+            """)
+
+        # Decision history.
         connection.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +98,20 @@ def initialize_database():
                 decision TEXT NOT NULL
                     CHECK(decision IN ('approved', 'rejected')),
                 decided_at TEXT NOT NULL
+            )
+        """)
+
+        # File execution history.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS execution_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id INTEGER NOT NULL,
+                tool TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('completed', 'failed')),
+                message TEXT NOT NULL,
+                executed_at TEXT NOT NULL
             )
         """)
 
@@ -159,7 +200,6 @@ def decide_action(action_id: int, request: DecisionRequest):
 
     with get_db_connection() as connection:
 
-        # Find the requested action.
         action = connection.execute(
             "SELECT * FROM actions WHERE id = ?",
             (action_id,),
@@ -171,20 +211,17 @@ def decide_action(action_id: int, request: DecisionRequest):
                 detail="Action not found",
             )
 
-        # Prevent changing an already reviewed action.
         if action["status"] != "pending":
             raise HTTPException(
                 status_code=409,
                 detail="This action has already been reviewed",
             )
 
-        # Update the action status.
         connection.execute(
             "UPDATE actions SET status = ? WHERE id = ?",
             (request.decision, action_id),
         )
 
-        # Record the decision in the audit log.
         connection.execute(
             """
             INSERT INTO audit_log (action_id, decision, decided_at)
@@ -197,7 +234,6 @@ def decide_action(action_id: int, request: DecisionRequest):
             ),
         )
 
-        # Get the updated action.
         updated_action = connection.execute(
             "SELECT * FROM actions WHERE id = ?",
             (action_id,),
@@ -209,13 +245,11 @@ def decide_action(action_id: int, request: DecisionRequest):
     }
 
 
-# Get the decision history.
+# Get approval and rejection history.
 @app.get("/audit-log")
 def get_audit_log():
-
     with get_db_connection() as connection:
-        rows = connection.execute(
-            """
+        rows = connection.execute("""
             SELECT
                 audit_log.id,
                 audit_log.action_id,
@@ -225,7 +259,160 @@ def get_audit_log():
             FROM audit_log
             JOIN actions ON actions.id = audit_log.action_id
             ORDER BY audit_log.id DESC
+        """).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+# Execute an action only after human approval.
+@app.post("/actions/{action_id}/execute")
+def execute_approved_action(action_id: int):
+
+    # First check the approval status and reserve the action.
+    with get_db_connection() as connection:
+
+        action = connection.execute(
+            "SELECT * FROM actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+
+        if action is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Action not found",
+            )
+
+        if action["status"] != "approved":
+            raise HTTPException(
+                status_code=403,
+                detail="Human approval is required before execution.",
+            )
+
+        if action["execution_status"] != "not_started":
+            raise HTTPException(
+                status_code=409,
+                detail="This action has already been attempted or executed.",
+            )
+
+        cursor = connection.execute(
             """
-        ).fetchall()
+            UPDATE actions
+            SET execution_status = 'running'
+            WHERE id = ?
+              AND status = 'approved'
+              AND execution_status = 'not_started'
+            """,
+            (action_id,),
+        )
+
+        if cursor.rowcount != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="This action is no longer available for execution.",
+            )
+
+        action_data = dict(action)
+
+    # Now perform the approved file operation.
+    try:
+        result = execute_file_action(
+            action_data["tool"],
+            action_data["target"],
+        )
+
+    except Exception as error:
+
+        error_message = str(error)
+
+        with get_db_connection() as connection:
+
+            connection.execute(
+                """
+                UPDATE actions
+                SET execution_status = 'failed',
+                    execution_message = ?
+                WHERE id = ?
+                """,
+                (error_message, action_id),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO execution_log
+                (action_id, tool, target, status, message, executed_at)
+                VALUES (?, ?, ?, 'failed', ?, ?)
+                """,
+                (
+                    action_id,
+                    action_data["tool"],
+                    action_data["target"],
+                    error_message,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"File execution failed: {error_message}",
+        )
+
+    # Save the successful execution.
+    with get_db_connection() as connection:
+
+        connection.execute(
+            """
+            UPDATE actions
+            SET execution_status = 'completed',
+                execution_message = ?
+            WHERE id = ?
+            """,
+            (result["message"], action_id),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO execution_log
+            (action_id, tool, target, status, message, executed_at)
+            VALUES (?, ?, ?, 'completed', ?, ?)
+            """,
+            (
+                action_id,
+                action_data["tool"],
+                action_data["target"],
+                result["message"],
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+
+        updated_action = connection.execute(
+            "SELECT * FROM actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+
+    return {
+        "message": "Approved action executed successfully.",
+        "action": dict(updated_action),
+        "execution": result,
+    }
+
+
+# Get file execution history.
+@app.get("/execution-log")
+def get_execution_log():
+    with get_db_connection() as connection:
+        rows = connection.execute("""
+            SELECT
+                execution_log.id,
+                execution_log.action_id,
+                actions.title,
+                execution_log.tool,
+                execution_log.target,
+                execution_log.status,
+                execution_log.message,
+                execution_log.executed_at
+            FROM execution_log
+            JOIN actions ON actions.id = execution_log.action_id
+            ORDER BY execution_log.id DESC
+        """).fetchall()
 
     return [dict(row) for row in rows]
