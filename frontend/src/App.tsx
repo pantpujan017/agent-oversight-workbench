@@ -34,56 +34,84 @@ function App() {
       });
   }, []);
 
-  const [actions, setActions] = useState<AgentAction[]>([
-    {
-      id: 1,
-      title: "Copy project plan",
-      description: "Agent wants to copy a project document.",
-      tool: "copy_file",
-      target: "project/plan.txt → review/plan.txt",
-      status: "pending",
-    },
-    {
-      id: 2,
-      title: "Move meeting notes",
-      description: "Agent wants to move a meeting document.",
-      tool: "move_file",
-      target: "project/meeting_notes.txt → archive/",
-      status: "pending",
-    },
-    {
-      id: 3,
-      title: "Rename draft document",
-      description: "Agent wants to rename a draft file.",
-      tool: "rename_file",
-      target: "draft.docx → final_draft.docx",
-      status: "pending",
-    },
-  ]);
+ const [actions, setActions] = useState<AgentAction[]>([]);
+
+const [actionsLoading, setActionsLoading] = useState(true);
+
+const [actionsError, setActionsError] = useState<string | null>(null);
+
+
+useEffect(() => {
+  const loadActions = async () => {
+    try {
+      const response = await fetch(
+        "http://127.0.0.1:8000/actions"
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not load agent actions");
+      }
+
+      const data: AgentAction[] = await response.json();
+
+      setActions(data);
+    } catch (error) {
+      setActionsError(
+        error instanceof Error
+          ? error.message
+          : "Something went wrong"
+      );
+    } finally {
+      setActionsLoading(false);
+    }
+  };
+
+  loadActions();
+}, []);
+
 
   const pendingCount = actions.filter(
     (action) => action.status === "pending"
   ).length;
 
-  const approveAction = (id: number) => {
-    setActions((previous) =>
-      previous.map((action) =>
-        action.id === id
-          ? { ...action, status: "approved" }
-          : action
-      )
+  const decideAction = async (
+  id: number,
+  decision: "approved" | "rejected"
+) => {
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:8000/actions/${id}/decision`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ decision }),
+      }
     );
-  };
 
-  const rejectAction = (id: number) => {
-    setActions((previous) =>
-      previous.map((action) =>
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || "Decision failed");
+    }
+
+    const data = await response.json();
+
+    setActions((currentActions) =>
+      currentActions.map((action) =>
         action.id === id
-          ? { ...action, status: "rejected" }
+          ? { ...action, status: data.action.status }
           : action
       )
     );
-  };
+  } catch (error) {
+    alert(error instanceof Error ? error.message : "Something went wrong");
+  }
+};
+
+const approveAction = (id: number) => decideAction(id, "approved");
+
+const rejectAction = (id: number) => decideAction(id, "rejected");
 
   return (
     <div className="app-shell">
@@ -213,7 +241,12 @@ function App() {
             </div>
 
             <div className="action-list">
-              {actions.map((action) => (
+            {actionsLoading && <p>Loading agent actions...</p>}
+
+{actionsError && (
+  <p style={{ color: "red" }}>{actionsError}</p>
+)}
+              {!actionsLoading && !actionsError && actions.map((action) => (
                 <div className="action-card" key={action.id}>
                   <div className="action-icon">↗</div>
 
@@ -252,7 +285,7 @@ function App() {
                 </div>
               ))}
 
-              {pendingCount === 0 && (
+              {!actionsLoading && !actionsError && actions.length > 0 && pendingCount === 0 && (
                 <div className="empty-state">
                   <span>✓</span>
                   <h3>All actions reviewed</h3>
