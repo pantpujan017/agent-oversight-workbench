@@ -9,6 +9,12 @@ type AgentAction = {
   tool: string;
   target: string;
   status: "pending" | "approved" | "rejected";
+  execution_status:
+    | "not_started"
+    | "running"
+    | "completed"
+    | "failed";
+  execution_message: string;
 };
 
 type AuditEntry = {
@@ -19,7 +25,6 @@ type AuditEntry = {
   decided_at: string;
 };
 
-// Retrieve audit history from the backend.
 async function fetchAuditLog(): Promise<AuditEntry[]> {
   const response = await fetch("http://127.0.0.1:8000/audit-log");
 
@@ -63,19 +68,21 @@ function App() {
   }, []);
 
   // Load actions from the backend.
+  const refreshActions = async () => {
+    const response = await fetch("http://127.0.0.1:8000/actions");
+
+    if (!response.ok) {
+      throw new Error("Could not load agent actions");
+    }
+
+    const data: AgentAction[] = await response.json();
+    setActions(data);
+  };
+
   useEffect(() => {
     const loadActions = async () => {
       try {
-        const response = await fetch(
-          "http://127.0.0.1:8000/actions"
-        );
-
-        if (!response.ok) {
-          throw new Error("Could not load agent actions");
-        }
-
-        const data: AgentAction[] = await response.json();
-        setActions(data);
+        await refreshActions();
       } catch (error) {
         setActionsError(
           error instanceof Error
@@ -90,7 +97,7 @@ function App() {
     loadActions();
   }, []);
 
-  // Load audit history from the backend.
+  // Load audit history.
   useEffect(() => {
     const loadAuditLog = async () => {
       try {
@@ -110,12 +117,11 @@ function App() {
     loadAuditLog();
   }, []);
 
-  // Count pending actions.
   const pendingCount = actions.filter(
     (action) => action.status === "pending"
   ).length;
 
-  // Send approval or rejection to the backend.
+  // Approve or reject an action.
   const decideAction = async (
     id: number,
     decision: "approved" | "rejected"
@@ -132,34 +138,21 @@ function App() {
         }
       );
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || "Decision failed");
-      }
-
       const data = await response.json();
 
-      // Update the action shown on the dashboard.
+      if (!response.ok) {
+        throw new Error(data.detail || "Decision failed");
+      }
+
       setActions((currentActions) =>
         currentActions.map((action) =>
-          action.id === id
-            ? { ...action, status: data.action.status }
-            : action
+          action.id === id ? data.action : action
         )
       );
 
-      // Refresh audit history after the decision.
-      try {
-        const updatedLogs = await fetchAuditLog();
-        setAuditLogs(updatedLogs);
-        setAuditError(null);
-      } catch (error) {
-        setAuditError(
-          error instanceof Error
-            ? error.message
-            : "Could not refresh decision history"
-        );
-      }
+      const updatedLogs = await fetchAuditLog();
+      setAuditLogs(updatedLogs);
+      setAuditError(null);
     } catch (error) {
       alert(
         error instanceof Error
@@ -174,6 +167,55 @@ function App() {
 
   const rejectAction = (id: number) =>
     decideAction(id, "rejected");
+
+  // Execute an approved file operation.
+  const executeAction = async (id: number) => {
+    // Immediately show that execution has started.
+    setActions((currentActions) =>
+      currentActions.map((action) =>
+        action.id === id
+          ? { ...action, execution_status: "running" }
+          : action
+      )
+    );
+
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8000/actions/${id}/execute`,
+        {
+          method: "POST",
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Execution failed");
+      }
+
+      // Display the updated action returned by the backend.
+      setActions((currentActions) =>
+        currentActions.map((action) =>
+          action.id === id ? data.action : action
+        )
+      );
+
+      alert("File operation completed successfully!");
+    } catch (error) {
+      // Reload the action so a failed execution is displayed.
+      try {
+        await refreshActions();
+      } catch {
+        // Keep the original error message.
+      }
+
+      alert(
+        error instanceof Error
+          ? error.message
+          : "Something went wrong"
+      );
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -253,9 +295,7 @@ function App() {
             </div>
 
             <div className="connection-status">
-              <span
-                className={`status-dot ${backendStatus}`}
-              ></span>
+              <span className={`status-dot ${backendStatus}`}></span>
 
               {backendStatus === "connected"
                 ? "Backend connected"
@@ -270,15 +310,11 @@ function App() {
             <div className="stat-card">
               <span className="stat-label">ACTIVE AGENTS</span>
               <strong>1</strong>
-              <span className="stat-description">
-                Demo agent
-              </span>
+              <span className="stat-description">Demo agent</span>
             </div>
 
             <div className="stat-card">
-              <span className="stat-label">
-                PENDING APPROVALS
-              </span>
+              <span className="stat-label">PENDING APPROVALS</span>
               <strong>{pendingCount}</strong>
               <span className="stat-description">
                 Require your review
@@ -286,13 +322,9 @@ function App() {
             </div>
 
             <div className="stat-card">
-              <span className="stat-label">
-                APPROVED ACTIONS
-              </span>
+              <span className="stat-label">APPROVED ACTIONS</span>
               <strong>
-                {actions.filter(
-                  (action) => action.status === "approved"
-                ).length}
+                {actions.filter((a) => a.status === "approved").length}
               </strong>
               <span className="stat-description">
                 Saved in database
@@ -300,13 +332,9 @@ function App() {
             </div>
 
             <div className="stat-card">
-              <span className="stat-label">
-                REJECTED ACTIONS
-              </span>
+              <span className="stat-label">REJECTED ACTIONS</span>
               <strong>
-                {actions.filter(
-                  (action) => action.status === "rejected"
-                ).length}
+                {actions.filter((a) => a.status === "rejected").length}
               </strong>
               <span className="stat-description">
                 Saved in database
@@ -318,13 +346,9 @@ function App() {
           <section className="panel">
             <div className="panel-header">
               <div>
-                <span className="eyebrow">
-                  HUMAN OVERSIGHT
-                </span>
+                <span className="eyebrow">HUMAN OVERSIGHT</span>
                 <h2>Action approval queue</h2>
-                <p>
-                  Review each action before it can proceed.
-                </p>
+                <p>Review each action before it can proceed.</p>
               </div>
 
               <span className="queue-count">
@@ -333,31 +357,23 @@ function App() {
             </div>
 
             <div className="action-list">
-              {actionsLoading && (
-                <p>Loading agent actions...</p>
-              )}
+              {actionsLoading && <p>Loading agent actions...</p>}
 
               {actionsError && (
-                <p style={{ color: "red" }}>
-                  {actionsError}
-                </p>
+                <p style={{ color: "red" }}>{actionsError}</p>
               )}
 
               {!actionsLoading &&
                 !actionsError &&
                 actions.map((action) => (
-                  <div
-                    className="action-card"
-                    key={action.id}
-                  >
+                  <div className="action-card" key={action.id}>
                     <div className="action-icon">↗</div>
 
                     <div className="action-details">
                       <div className="action-title-row">
                         <h3>{action.title}</h3>
-                        <span
-                          className={`badge ${action.status}`}
-                        >
+
+                        <span className={`badge ${action.status}`}>
                           {action.status}
                         </span>
                       </div>
@@ -368,25 +384,53 @@ function App() {
                         <span>TOOL: {action.tool}</span>
                         <span>TARGET: {action.target}</span>
                       </div>
+
+                      <div className="action-metadata">
+                        <span>
+                          EXECUTION:{" "}
+                          {action.execution_status
+                            .replace("_", " ")
+                            .toUpperCase()}
+                        </span>
+                        {action.execution_message && (
+                          <span>{action.execution_message}</span>
+                        )}
+                      </div>
                     </div>
 
-                    {action.status === "pending" && (
-                      <div className="action-buttons">
-                        <button
-                          className="reject-button"
-                          onClick={() => rejectAction(action.id)}
-                        >
-                          Reject
-                        </button>
+                    <div className="action-buttons">
+                      {action.status === "pending" && (
+                        <>
+                          <button
+                            className="reject-button"
+                            onClick={() => rejectAction(action.id)}
+                          >
+                            Reject
+                          </button>
 
-                        <button
-                          className="approve-button"
-                          onClick={() => approveAction(action.id)}
-                        >
-                          Approve
-                        </button>
-                      </div>
-                    )}
+                          <button
+                            className="approve-button"
+                            onClick={() => approveAction(action.id)}
+                          >
+                            Approve
+                          </button>
+                        </>
+                      )}
+
+                      {action.status === "approved" &&
+                        action.execution_status === "not_started" && (
+                          <button
+                            className="approve-button"
+                            onClick={() => executeAction(action.id)}
+                          >
+                            Execute
+                          </button>
+                        )}
+
+                      {action.execution_status === "running" && (
+                        <span>Executing...</span>
+                      )}
+                    </div>
                   </div>
                 ))}
 
@@ -405,11 +449,8 @@ function App() {
             </div>
           </section>
 
-          {/* Audit history */}
-          <section
-            className="panel"
-            id="audit-history"
-          >
+          {/* Decision history */}
+          <section className="panel" id="audit-history">
             <div className="panel-header">
               <div>
                 <span className="eyebrow">
@@ -417,8 +458,7 @@ function App() {
                 </span>
                 <h2>Decision history</h2>
                 <p>
-                  A record of actions that have been approved
-                  or rejected.
+                  A record of actions that have been approved or rejected.
                 </p>
               </div>
 
@@ -428,14 +468,10 @@ function App() {
             </div>
 
             <div className="action-list">
-              {auditLoading && (
-                <p>Loading decision history...</p>
-              )}
+              {auditLoading && <p>Loading decision history...</p>}
 
               {auditError && (
-                <p style={{ color: "red" }}>
-                  {auditError}
-                </p>
+                <p style={{ color: "red" }}>{auditError}</p>
               )}
 
               {!auditLoading &&
@@ -453,10 +489,7 @@ function App() {
               {!auditLoading &&
                 !auditError &&
                 auditLogs.map((entry) => (
-                  <div
-                    className="action-card"
-                    key={entry.id}
-                  >
+                  <div className="action-card" key={entry.id}>
                     <div className="action-icon">
                       {entry.decision === "approved" ? "✓" : "×"}
                     </div>
@@ -465,16 +498,12 @@ function App() {
                       <div className="action-title-row">
                         <h3>{entry.title}</h3>
 
-                        <span
-                          className={`badge ${entry.decision}`}
-                        >
+                        <span className={`badge ${entry.decision}`}>
                           {entry.decision}
                         </span>
                       </div>
 
-                      <p>
-                        Action ID: {entry.action_id}
-                      </p>
+                      <p>Action ID: {entry.action_id}</p>
 
                       <div className="action-metadata">
                         <span>
@@ -482,9 +511,7 @@ function App() {
                         </span>
                         <span>
                           TIME:{" "}
-                          {new Date(
-                            entry.decided_at
-                          ).toLocaleString()}
+                          {new Date(entry.decided_at).toLocaleString()}
                         </span>
                       </div>
                     </div>
@@ -493,14 +520,12 @@ function App() {
             </div>
           </section>
 
-          {/* Information notice */}
           <div className="notice">
             <span>ⓘ</span>
             <p>
-              Demo mode: Actions are sample proposals.
-              Approval and rejection decisions are saved in
-              SQLite and recorded in the audit log. No real
-              files are modified yet.
+              Demo mode: Actions are sample proposals. Approved actions
+              can be executed inside the dedicated test workspace.
+              Decisions and execution results are saved in SQLite.
             </p>
           </div>
         </section>
