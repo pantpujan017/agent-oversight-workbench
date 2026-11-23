@@ -11,11 +11,39 @@ type AgentAction = {
   status: "pending" | "approved" | "rejected";
 };
 
+type AuditEntry = {
+  id: number;
+  action_id: number;
+  title: string;
+  decision: "approved" | "rejected";
+  decided_at: string;
+};
+
+// Retrieve audit history from the backend.
+async function fetchAuditLog(): Promise<AuditEntry[]> {
+  const response = await fetch("http://127.0.0.1:8000/audit-log");
+
+  if (!response.ok) {
+    throw new Error("Could not load decision history");
+  }
+
+  return response.json();
+}
+
 function App() {
   const [backendStatus, setBackendStatus] = useState<
     "checking" | "connected" | "disconnected"
   >("checking");
 
+  const [actions, setActions] = useState<AgentAction[]>([]);
+  const [actionsLoading, setActionsLoading] = useState(true);
+  const [actionsError, setActionsError] = useState<string | null>(null);
+
+  const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
+  const [auditLoading, setAuditLoading] = useState(true);
+  const [auditError, setAuditError] = useState<string | null>(null);
+
+  // Check backend connection.
   useEffect(() => {
     fetch("http://127.0.0.1:8000/health")
       .then((response) => {
@@ -34,84 +62,118 @@ function App() {
       });
   }, []);
 
- const [actions, setActions] = useState<AgentAction[]>([]);
+  // Load actions from the backend.
+  useEffect(() => {
+    const loadActions = async () => {
+      try {
+        const response = await fetch(
+          "http://127.0.0.1:8000/actions"
+        );
 
-const [actionsLoading, setActionsLoading] = useState(true);
+        if (!response.ok) {
+          throw new Error("Could not load agent actions");
+        }
 
-const [actionsError, setActionsError] = useState<string | null>(null);
-
-
-useEffect(() => {
-  const loadActions = async () => {
-    try {
-      const response = await fetch(
-        "http://127.0.0.1:8000/actions"
-      );
-
-      if (!response.ok) {
-        throw new Error("Could not load agent actions");
+        const data: AgentAction[] = await response.json();
+        setActions(data);
+      } catch (error) {
+        setActionsError(
+          error instanceof Error
+            ? error.message
+            : "Something went wrong"
+        );
+      } finally {
+        setActionsLoading(false);
       }
+    };
 
-      const data: AgentAction[] = await response.json();
+    loadActions();
+  }, []);
 
-      setActions(data);
-    } catch (error) {
-      setActionsError(
-        error instanceof Error
-          ? error.message
-          : "Something went wrong"
-      );
-    } finally {
-      setActionsLoading(false);
-    }
-  };
+  // Load audit history from the backend.
+  useEffect(() => {
+    const loadAuditLog = async () => {
+      try {
+        const data = await fetchAuditLog();
+        setAuditLogs(data);
+      } catch (error) {
+        setAuditError(
+          error instanceof Error
+            ? error.message
+            : "Could not load decision history"
+        );
+      } finally {
+        setAuditLoading(false);
+      }
+    };
 
-  loadActions();
-}, []);
+    loadAuditLog();
+  }, []);
 
-
+  // Count pending actions.
   const pendingCount = actions.filter(
     (action) => action.status === "pending"
   ).length;
 
+  // Send approval or rejection to the backend.
   const decideAction = async (
-  id: number,
-  decision: "approved" | "rejected"
-) => {
-  try {
-    const response = await fetch(
-      `http://127.0.0.1:8000/actions/${id}/decision`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ decision }),
+    id: number,
+    decision: "approved" | "rejected"
+  ) => {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8000/actions/${id}/decision`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ decision }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || "Decision failed");
       }
-    );
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.detail || "Decision failed");
+      const data = await response.json();
+
+      // Update the action shown on the dashboard.
+      setActions((currentActions) =>
+        currentActions.map((action) =>
+          action.id === id
+            ? { ...action, status: data.action.status }
+            : action
+        )
+      );
+
+      // Refresh audit history after the decision.
+      try {
+        const updatedLogs = await fetchAuditLog();
+        setAuditLogs(updatedLogs);
+        setAuditError(null);
+      } catch (error) {
+        setAuditError(
+          error instanceof Error
+            ? error.message
+            : "Could not refresh decision history"
+        );
+      }
+    } catch (error) {
+      alert(
+        error instanceof Error
+          ? error.message
+          : "Something went wrong"
+      );
     }
+  };
 
-    const data = await response.json();
+  const approveAction = (id: number) =>
+    decideAction(id, "approved");
 
-    setActions((currentActions) =>
-      currentActions.map((action) =>
-        action.id === id
-          ? { ...action, status: data.action.status }
-          : action
-      )
-    );
-  } catch (error) {
-    alert(error instanceof Error ? error.message : "Something went wrong");
-  }
-};
-
-const approveAction = (id: number) => decideAction(id, "approved");
-
-const rejectAction = (id: number) => decideAction(id, "rejected");
+  const rejectAction = (id: number) =>
+    decideAction(id, "rejected");
 
   return (
     <div className="app-shell">
@@ -130,16 +192,20 @@ const rejectAction = (id: number) => decideAction(id, "rejected");
           <div className="nav-item active">
             <span>▦</span> Overview
           </div>
+
           <div className="nav-item">
             <span>◷</span> Approval Queue
             <span className="nav-count">{pendingCount}</span>
           </div>
-          <div className="nav-item">
+
+          <a className="nav-item" href="#audit-history">
             <span>☷</span> Activity Logs
-          </div>
+          </a>
+
           <div className="nav-item">
             <span>⬡</span> Policies
           </div>
+
           <div className="nav-item">
             <span>⚙</span> Settings
           </div>
@@ -150,6 +216,7 @@ const rejectAction = (id: number) => decideAction(id, "rejected");
             <span className="status-dot"></span>
             System operational
           </div>
+
           <div className="profile">
             <div className="avatar">PP</div>
             <div>
@@ -165,8 +232,11 @@ const rejectAction = (id: number) => decideAction(id, "rejected");
           <div className="breadcrumb">
             Workspace <span>/</span> Overview
           </div>
+
           <div className="topbar-right">
-            <span className="environment-tag">LOCAL ENVIRONMENT</span>
+            <span className="environment-tag">
+              LOCAL ENVIRONMENT
+            </span>
             <div className="avatar small-avatar">PP</div>
           </div>
         </header>
@@ -181,26 +251,34 @@ const rejectAction = (id: number) => decideAction(id, "rejected");
                 and stay in control of execution.
               </p>
             </div>
-            <div className="connection-status">
-  <span className={`status-dot ${backendStatus}`}></span>
 
-  {backendStatus === "connected"
-    ? "Backend connected"
-    : backendStatus === "checking"
-      ? "Checking backend..."
-      : "Backend disconnected"}
-</div>
+            <div className="connection-status">
+              <span
+                className={`status-dot ${backendStatus}`}
+              ></span>
+
+              {backendStatus === "connected"
+                ? "Backend connected"
+                : backendStatus === "checking"
+                  ? "Checking backend..."
+                  : "Backend disconnected"}
+            </div>
           </div>
 
+          {/* Dashboard statistics */}
           <section className="stats-grid">
             <div className="stat-card">
               <span className="stat-label">ACTIVE AGENTS</span>
               <strong>1</strong>
-              <span className="stat-description">Demo agent</span>
+              <span className="stat-description">
+                Demo agent
+              </span>
             </div>
 
             <div className="stat-card">
-              <span className="stat-label">PENDING APPROVALS</span>
+              <span className="stat-label">
+                PENDING APPROVALS
+              </span>
               <strong>{pendingCount}</strong>
               <span className="stat-description">
                 Require your review
@@ -208,99 +286,221 @@ const rejectAction = (id: number) => decideAction(id, "rejected");
             </div>
 
             <div className="stat-card">
-              <span className="stat-label">APPROVED ACTIONS</span>
+              <span className="stat-label">
+                APPROVED ACTIONS
+              </span>
               <strong>
-                {actions.filter((a) => a.status === "approved").length}
+                {actions.filter(
+                  (action) => action.status === "approved"
+                ).length}
               </strong>
               <span className="stat-description">
-                Approved in this session
+                Saved in database
               </span>
             </div>
 
             <div className="stat-card">
-              <span className="stat-label">REJECTED ACTIONS</span>
+              <span className="stat-label">
+                REJECTED ACTIONS
+              </span>
               <strong>
-                {actions.filter((a) => a.status === "rejected").length}
+                {actions.filter(
+                  (action) => action.status === "rejected"
+                ).length}
               </strong>
               <span className="stat-description">
-                Blocked in this session
+                Saved in database
               </span>
             </div>
           </section>
 
+          {/* Approval queue */}
           <section className="panel">
             <div className="panel-header">
               <div>
-                <span className="eyebrow">HUMAN OVERSIGHT</span>
+                <span className="eyebrow">
+                  HUMAN OVERSIGHT
+                </span>
                 <h2>Action approval queue</h2>
-                <p>Review each action before it can proceed.</p>
+                <p>
+                  Review each action before it can proceed.
+                </p>
               </div>
+
               <span className="queue-count">
                 {pendingCount} awaiting review
               </span>
             </div>
 
             <div className="action-list">
-            {actionsLoading && <p>Loading agent actions...</p>}
-
-{actionsError && (
-  <p style={{ color: "red" }}>{actionsError}</p>
-)}
-              {!actionsLoading && !actionsError && actions.map((action) => (
-                <div className="action-card" key={action.id}>
-                  <div className="action-icon">↗</div>
-
-                  <div className="action-details">
-                    <div className="action-title-row">
-                      <h3>{action.title}</h3>
-                      <span className={`badge ${action.status}`}>
-                        {action.status}
-                      </span>
-                    </div>
-
-                    <p>{action.description}</p>
-
-                    <div className="action-metadata">
-                      <span>TOOL: {action.tool}</span>
-                      <span>TARGET: {action.target}</span>
-                    </div>
-                  </div>
-
-                  {action.status === "pending" && (
-                    <div className="action-buttons">
-                      <button
-                        className="reject-button"
-                        onClick={() => rejectAction(action.id)}
-                      >
-                        Reject
-                      </button>
-                      <button
-                        className="approve-button"
-                        onClick={() => approveAction(action.id)}
-                      >
-                        Approve
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
-
-              {!actionsLoading && !actionsError && actions.length > 0 && pendingCount === 0 && (
-                <div className="empty-state">
-                  <span>✓</span>
-                  <h3>All actions reviewed</h3>
-                  <p>No pending approvals remain in this demo.</p>
-                </div>
+              {actionsLoading && (
+                <p>Loading agent actions...</p>
               )}
+
+              {actionsError && (
+                <p style={{ color: "red" }}>
+                  {actionsError}
+                </p>
+              )}
+
+              {!actionsLoading &&
+                !actionsError &&
+                actions.map((action) => (
+                  <div
+                    className="action-card"
+                    key={action.id}
+                  >
+                    <div className="action-icon">↗</div>
+
+                    <div className="action-details">
+                      <div className="action-title-row">
+                        <h3>{action.title}</h3>
+                        <span
+                          className={`badge ${action.status}`}
+                        >
+                          {action.status}
+                        </span>
+                      </div>
+
+                      <p>{action.description}</p>
+
+                      <div className="action-metadata">
+                        <span>TOOL: {action.tool}</span>
+                        <span>TARGET: {action.target}</span>
+                      </div>
+                    </div>
+
+                    {action.status === "pending" && (
+                      <div className="action-buttons">
+                        <button
+                          className="reject-button"
+                          onClick={() => rejectAction(action.id)}
+                        >
+                          Reject
+                        </button>
+
+                        <button
+                          className="approve-button"
+                          onClick={() => approveAction(action.id)}
+                        >
+                          Approve
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+              {!actionsLoading &&
+                !actionsError &&
+                actions.length > 0 &&
+                pendingCount === 0 && (
+                  <div className="empty-state">
+                    <span>✓</span>
+                    <h3>All actions reviewed</h3>
+                    <p>
+                      No pending approvals remain in this demo.
+                    </p>
+                  </div>
+                )}
             </div>
           </section>
 
+          {/* Audit history */}
+          <section
+            className="panel"
+            id="audit-history"
+          >
+            <div className="panel-header">
+              <div>
+                <span className="eyebrow">
+                  TRANSPARENCY & ACCOUNTABILITY
+                </span>
+                <h2>Decision history</h2>
+                <p>
+                  A record of actions that have been approved
+                  or rejected.
+                </p>
+              </div>
+
+              <span className="queue-count">
+                {auditLogs.length} recorded decisions
+              </span>
+            </div>
+
+            <div className="action-list">
+              {auditLoading && (
+                <p>Loading decision history...</p>
+              )}
+
+              {auditError && (
+                <p style={{ color: "red" }}>
+                  {auditError}
+                </p>
+              )}
+
+              {!auditLoading &&
+                !auditError &&
+                auditLogs.length === 0 && (
+                  <div className="empty-state">
+                    <span>☷</span>
+                    <h3>No decisions recorded yet</h3>
+                    <p>
+                      New approvals and rejections will appear here.
+                    </p>
+                  </div>
+                )}
+
+              {!auditLoading &&
+                !auditError &&
+                auditLogs.map((entry) => (
+                  <div
+                    className="action-card"
+                    key={entry.id}
+                  >
+                    <div className="action-icon">
+                      {entry.decision === "approved" ? "✓" : "×"}
+                    </div>
+
+                    <div className="action-details">
+                      <div className="action-title-row">
+                        <h3>{entry.title}</h3>
+
+                        <span
+                          className={`badge ${entry.decision}`}
+                        >
+                          {entry.decision}
+                        </span>
+                      </div>
+
+                      <p>
+                        Action ID: {entry.action_id}
+                      </p>
+
+                      <div className="action-metadata">
+                        <span>
+                          DECISION: {entry.decision.toUpperCase()}
+                        </span>
+                        <span>
+                          TIME:{" "}
+                          {new Date(
+                            entry.decided_at
+                          ).toLocaleString()}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          </section>
+
+          {/* Information notice */}
           <div className="notice">
             <span>ⓘ</span>
             <p>
               Demo mode: Actions are sample proposals.
-              Approval and rejection currently update only
-              the frontend state. No real files are modified.
+              Approval and rejection decisions are saved in
+              SQLite and recorded in the audit log. No real
+              files are modified yet.
             </p>
           </div>
         </section>
