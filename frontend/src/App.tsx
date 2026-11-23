@@ -25,11 +25,34 @@ type AuditEntry = {
   decided_at: string;
 };
 
+type ExecutionEntry = {
+  id: number;
+  action_id: number;
+  title: string;
+  tool: string;
+  target: string;
+  status: "completed" | "failed";
+  message: string;
+  executed_at: string;
+};
+
+const API_URL = "http://127.0.0.1:8000";
+
 async function fetchAuditLog(): Promise<AuditEntry[]> {
-  const response = await fetch("http://127.0.0.1:8000/audit-log");
+  const response = await fetch(`${API_URL}/audit-log`);
 
   if (!response.ok) {
     throw new Error("Could not load decision history");
+  }
+
+  return response.json();
+}
+
+async function fetchExecutionLog(): Promise<ExecutionEntry[]> {
+  const response = await fetch(`${API_URL}/execution-log`);
+
+  if (!response.ok) {
+    throw new Error("Could not load execution history");
   }
 
   return response.json();
@@ -48,9 +71,13 @@ function App() {
   const [auditLoading, setAuditLoading] = useState(true);
   const [auditError, setAuditError] = useState<string | null>(null);
 
+  const [executionLogs, setExecutionLogs] = useState<ExecutionEntry[]>([]);
+  const [executionLoading, setExecutionLoading] = useState(true);
+  const [executionError, setExecutionError] = useState<string | null>(null);
+
   // Check backend connection.
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/health")
+    fetch(`${API_URL}/health`)
       .then((response) => {
         if (!response.ok) {
           throw new Error("Backend request failed");
@@ -67,9 +94,9 @@ function App() {
       });
   }, []);
 
-  // Load actions from the backend.
+  // Refresh actions from the backend.
   const refreshActions = async () => {
-    const response = await fetch("http://127.0.0.1:8000/actions");
+    const response = await fetch(`${API_URL}/actions`);
 
     if (!response.ok) {
       throw new Error("Could not load agent actions");
@@ -79,30 +106,37 @@ function App() {
     setActions(data);
   };
 
+  // Refresh decision history.
+  const refreshAuditLogs = async () => {
+    const data = await fetchAuditLog();
+    setAuditLogs(data);
+    setAuditError(null);
+  };
+
+  // Refresh execution history.
+  const refreshExecutionLogs = async () => {
+    const data = await fetchExecutionLog();
+    setExecutionLogs(data);
+    setExecutionError(null);
+  };
+
+  // Load all dashboard data.
   useEffect(() => {
-    const loadActions = async () => {
+    const loadDashboard = async () => {
       try {
         await refreshActions();
       } catch (error) {
         setActionsError(
           error instanceof Error
             ? error.message
-            : "Something went wrong"
+            : "Could not load actions"
         );
       } finally {
         setActionsLoading(false);
       }
-    };
 
-    loadActions();
-  }, []);
-
-  // Load audit history.
-  useEffect(() => {
-    const loadAuditLog = async () => {
       try {
-        const data = await fetchAuditLog();
-        setAuditLogs(data);
+        await refreshAuditLogs();
       } catch (error) {
         setAuditError(
           error instanceof Error
@@ -112,9 +146,21 @@ function App() {
       } finally {
         setAuditLoading(false);
       }
+
+      try {
+        await refreshExecutionLogs();
+      } catch (error) {
+        setExecutionError(
+          error instanceof Error
+            ? error.message
+            : "Could not load execution history"
+        );
+      } finally {
+        setExecutionLoading(false);
+      }
     };
 
-    loadAuditLog();
+    loadDashboard();
   }, []);
 
   const pendingCount = actions.filter(
@@ -128,7 +174,7 @@ function App() {
   ) => {
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/actions/${id}/decision`,
+        `${API_URL}/actions/${id}/decision`,
         {
           method: "POST",
           headers: {
@@ -150,9 +196,7 @@ function App() {
         )
       );
 
-      const updatedLogs = await fetchAuditLog();
-      setAuditLogs(updatedLogs);
-      setAuditError(null);
+      await refreshAuditLogs();
     } catch (error) {
       alert(
         error instanceof Error
@@ -170,7 +214,6 @@ function App() {
 
   // Execute an approved file operation.
   const executeAction = async (id: number) => {
-    // Immediately show that execution has started.
     setActions((currentActions) =>
       currentActions.map((action) =>
         action.id === id
@@ -181,7 +224,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/actions/${id}/execute`,
+        `${API_URL}/actions/${id}/execute`,
         {
           method: "POST",
         }
@@ -193,20 +236,22 @@ function App() {
         throw new Error(data.detail || "Execution failed");
       }
 
-      // Display the updated action returned by the backend.
       setActions((currentActions) =>
         currentActions.map((action) =>
           action.id === id ? data.action : action
         )
       );
 
+      await refreshExecutionLogs();
+
       alert("File operation completed successfully!");
     } catch (error) {
-      // Reload the action so a failed execution is displayed.
+      // Reload the latest status, including failed executions.
       try {
         await refreshActions();
+        await refreshExecutionLogs();
       } catch {
-        // Keep the original error message.
+        // Preserve the original execution error.
       }
 
       alert(
@@ -231,17 +276,21 @@ function App() {
         <div className="workspace-label">WORKSPACE</div>
 
         <nav className="navigation">
-          <div className="nav-item active">
+          <a className="nav-item active" href="#">
             <span>▦</span> Overview
-          </div>
+          </a>
 
-          <div className="nav-item">
+          <a className="nav-item" href="#approval-queue">
             <span>◷</span> Approval Queue
             <span className="nav-count">{pendingCount}</span>
-          </div>
+          </a>
 
           <a className="nav-item" href="#audit-history">
             <span>☷</span> Activity Logs
+          </a>
+
+          <a className="nav-item" href="#execution-history">
+            <span>↗</span> Executions
           </a>
 
           <div className="nav-item">
@@ -343,7 +392,7 @@ function App() {
           </section>
 
           {/* Approval queue */}
-          <section className="panel">
+          <section className="panel" id="approval-queue">
             <div className="panel-header">
               <div>
                 <span className="eyebrow">HUMAN OVERSIGHT</span>
@@ -372,7 +421,6 @@ function App() {
                     <div className="action-details">
                       <div className="action-title-row">
                         <h3>{action.title}</h3>
-
                         <span className={`badge ${action.status}`}>
                           {action.status}
                         </span>
@@ -441,9 +489,7 @@ function App() {
                   <div className="empty-state">
                     <span>✓</span>
                     <h3>All actions reviewed</h3>
-                    <p>
-                      No pending approvals remain in this demo.
-                    </p>
+                    <p>No pending approvals remain in this demo.</p>
                   </div>
                 )}
             </div>
@@ -497,7 +543,6 @@ function App() {
                     <div className="action-details">
                       <div className="action-title-row">
                         <h3>{entry.title}</h3>
-
                         <span className={`badge ${entry.decision}`}>
                           {entry.decision}
                         </span>
@@ -510,10 +555,82 @@ function App() {
                           DECISION: {entry.decision.toUpperCase()}
                         </span>
                         <span>
-                          TIME:{" "}
-                          {new Date(entry.decided_at).toLocaleString()}
+                          TIME: {new Date(entry.decided_at).toLocaleString()}
                         </span>
                       </div>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          </section>
+
+          {/* Execution history */}
+          <section className="panel" id="execution-history">
+            <div className="panel-header">
+              <div>
+                <span className="eyebrow">
+                  EXECUTION MONITORING
+                </span>
+                <h2>Execution history</h2>
+                <p>
+                  Track file operations performed by the agent.
+                </p>
+              </div>
+
+              <span className="queue-count">
+                {executionLogs.length} execution records
+              </span>
+            </div>
+
+            <div className="action-list">
+              {executionLoading && (
+                <p>Loading execution history...</p>
+              )}
+
+              {executionError && (
+                <p style={{ color: "red" }}>{executionError}</p>
+              )}
+
+              {!executionLoading &&
+                !executionError &&
+                executionLogs.length === 0 && (
+                  <div className="empty-state">
+                    <span>↗</span>
+                    <h3>No executions recorded yet</h3>
+                    <p>
+                      Executed file operations will appear here.
+                    </p>
+                  </div>
+                )}
+
+              {!executionLoading &&
+                !executionError &&
+                executionLogs.map((entry) => (
+                  <div className="action-card" key={entry.id}>
+                    <div className="action-icon">
+                      {entry.status === "completed" ? "✓" : "×"}
+                    </div>
+
+                    <div className="action-details">
+                      <div className="action-title-row">
+                        <h3>{entry.title}</h3>
+                        <span className={`badge ${entry.status}`}>
+                          {entry.status}
+                        </span>
+                      </div>
+
+                      <p>
+                        Tool: {entry.tool} | Action ID: {entry.action_id}
+                      </p>
+
+                      <div className="action-metadata">
+                        <span>TARGET: {entry.target}</span>
+                        <span>
+                          TIME: {new Date(entry.executed_at).toLocaleString()}
+                        </span>
+                      </div>
+
+                      <p>{entry.message}</p>
                     </div>
                   </div>
                 ))}
@@ -523,9 +640,9 @@ function App() {
           <div className="notice">
             <span>ⓘ</span>
             <p>
-              Demo mode: Actions are sample proposals. Approved actions
-              can be executed inside the dedicated test workspace.
-              Decisions and execution results are saved in SQLite.
+              Demo mode: Approved actions can be executed inside the
+              dedicated test workspace. Decisions and execution results
+              are saved in SQLite. No personal files are modified.
             </p>
           </div>
         </section>
