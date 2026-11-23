@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from executor import execute_file_action
+from ai_service import generate_action_proposal
 
 
 app = FastAPI(
@@ -166,6 +167,9 @@ initialize_database()
 class DecisionRequest(BaseModel):
     decision: Literal["approved", "rejected"]
 
+class ProposalRequest(BaseModel):
+    instruction: str
+
 
 @app.get("/")
 def home():
@@ -192,6 +196,117 @@ def get_actions():
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+# Generate an AI proposal and add it to the approval queue.
+@app.post("/proposals")
+def create_proposal(request: ProposalRequest):
+
+    # Ask Gemini to interpret the user's instruction.
+    try:
+        proposal = generate_action_proposal(
+            request.instruction
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    except Exception as error:
+        print(f"Gemini proposal generation failed: {error}")
+
+        raise HTTPException(
+            status_code=502,
+            detail="AI service is temporarily unavailable or could not generate a proposal.",
+        )
+
+    # Do not add unclear or unsupported requests to the queue.
+    if proposal.needs_clarification or proposal.tool == "unsupported":
+        return {
+            "status": "needs_clarification",
+            "proposal": proposal.model_dump(),
+            "message": proposal.clarification_question,
+        }
+
+    # Combine source and destination into the format
+    # already understood by our file executor.
+    target = (
+        f"{proposal.source_path} → "
+        f"{proposal.destination_path}"
+    )
+
+
+    # Check whether an identical action is already waiting.
+    with get_db_connection() as connection:
+
+        existing_action = connection.execute(
+            """
+            SELECT * FROM actions
+            WHERE tool = ?
+              AND TRIM(target) = ?
+              AND (
+                  status = 'pending'
+                  OR (
+                      status = 'approved'
+                      AND execution_status IN ('not_started', 'running')
+                  )
+              )
+            ORDER BY id
+            LIMIT 1
+            """,
+            (proposal.tool, target),
+        ).fetchone()
+
+        if existing_action is not None:
+            return {
+                "status": "duplicate",
+                "message": (
+                    "This action already exists in the approval queue. "
+                    "No duplicate was created."
+                ),
+                "action": dict(existing_action),
+            }
+
+
+    # Save the AI proposal as pending human approval.
+    with get_db_connection() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO actions (
+                title,
+                description,
+                tool,
+                target,
+                status,
+                execution_status,
+                execution_message
+            )
+            VALUES (?, ?, ?, ?, 'pending', 'not_started', '')
+            """,
+            (
+                proposal.title,
+                proposal.description,
+                proposal.tool,
+                target,
+            ),
+        )
+
+        action_id = cursor.lastrowid
+
+        created_action = connection.execute(
+            "SELECT * FROM actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+
+    return {
+        "status": "pending_approval",
+        "message": "AI proposal added to the approval queue. It has not been executed.",
+        "action": dict(created_action),
+    }
+
 
 
 # Approve or reject an action and record the decision.

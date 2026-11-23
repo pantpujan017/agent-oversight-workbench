@@ -64,6 +64,9 @@ function App() {
   >("checking");
 
   const [actions, setActions] = useState<AgentAction[]>([]);
+  const [userInstruction, setUserInstruction] = useState("");
+  const [proposalLoading, setProposalLoading] = useState(false);
+  const [proposalError, setProposalError] = useState<string | null>(null);
   const [actionsLoading, setActionsLoading] = useState(true);
   const [actionsError, setActionsError] = useState<string | null>(null);
 
@@ -119,6 +122,71 @@ function App() {
     setExecutionLogs(data);
     setExecutionError(null);
   };
+
+
+  // Send a user instruction to Gemini.
+  const createProposal = async () => {
+    if (!userInstruction.trim()) {
+      return;
+    }
+
+    setProposalLoading(true);
+    setProposalError(null);
+
+    try {
+      const response = await fetch(
+        `${API_URL}/proposals`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            instruction: userInstruction,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || "Could not generate proposal"
+        );
+      }
+
+      // Handle requests that need clarification.
+if (data.status === "needs_clarification") {
+  alert(data.message);
+  return;
+}
+
+// Handle duplicate proposals.
+if (data.status === "duplicate") {
+  alert("Duplicate action: " + data.message);
+  return;
+}
+
+      // Load the newly generated proposal into the approval queue.
+      await refreshActions();
+
+      setUserInstruction("");
+
+      alert(
+        "AI proposal created! Please review it in the approval queue."
+      );
+
+    } catch (error) {
+      setProposalError(
+        error instanceof Error
+          ? error.message
+          : "Something went wrong"
+      );
+    } finally {
+      setProposalLoading(false);
+    }
+  };
+
 
   // Load all dashboard data.
   useEffect(() => {
@@ -390,6 +458,66 @@ function App() {
               </span>
             </div>
           </section>
+
+
+  {/* AI instruction panel */}
+  <section className="panel">
+    <div className="panel-header">
+      <div>
+        <span className="eyebrow">AI ASSISTANT</span>
+        <h2>Create an action with AI</h2>
+        <p>
+          Describe what you want the agent to do.
+          Gemini will generate a proposal for your approval.
+        </p>
+      </div>
+    </div>
+
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        void createProposal();
+      }}
+    >
+      <textarea
+        value={userInstruction}
+        onChange={(event) =>
+          setUserInstruction(event.target.value)
+        }
+        placeholder="Example: Copy the project plan into the archive folder."
+        rows={4}
+        maxLength={2000}
+        disabled={proposalLoading}
+        style={{
+          width: "100%",
+          padding: "14px",
+          border: "1px solid #d1d5db",
+          borderRadius: "8px",
+          resize: "vertical",
+          font: "inherit",
+          boxSizing: "border-box",
+          marginBottom: "12px",
+        }}
+      />
+
+      {proposalError && (
+        <p style={{ color: "red" }}>
+          {proposalError}
+        </p>
+      )}
+
+      <button
+        type="submit"
+        className="approve-button"
+        disabled={proposalLoading || !userInstruction.trim()}
+      >
+        {proposalLoading
+          ? "Generating proposal..."
+          : "Generate AI Proposal"}
+      </button>
+    </form>
+  </section>
+
 
           {/* Approval queue */}
           <section className="panel" id="approval-queue">
