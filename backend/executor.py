@@ -1,62 +1,13 @@
 
 import shutil
-from pathlib import Path, PureWindowsPath
+
+from workspace_paths import WORKSPACE_ROOT, resolve_workspace_path
 
 
-# The agent can only access this dedicated workspace.
-WORKSPACE_ROOT = (
-    Path(__file__).resolve().parent / "agent_workspace"
-).resolve()
 
 
-def resolve_workspace_path(
-    relative_path: str,
-    must_exist: bool = False,
-) -> Path:
-    """
-    Resolve a relative path and reject access outside
-    the dedicated agent workspace.
-    """
 
-    if not isinstance(relative_path, str):
-        raise ValueError("File path must be text.")
 
-    relative_path = relative_path.strip()
-
-    if not relative_path:
-        raise ValueError("File path cannot be empty.")
-
-    if "\x00" in relative_path:
-        raise ValueError("Invalid file path.")
-
-    # Check both Windows and normal path formats.
-    windows_path = PureWindowsPath(relative_path)
-    path = Path(relative_path)
-
-    # Reject absolute paths, drive paths and parent traversal.
-    if (
-        path.is_absolute()
-        or windows_path.is_absolute()
-        or windows_path.drive
-        or ".." in path.parts
-        or ".." in windows_path.parts
-    ):
-        raise ValueError(
-            "Access outside the agent workspace is not allowed."
-        )
-
-    # Resolve symlinks and normalize the path.
-    resolved_path = (
-        WORKSPACE_ROOT / path
-    ).resolve(strict=must_exist)
-
-    # Confirm the final resolved location stays inside the workspace.
-    if not resolved_path.is_relative_to(WORKSPACE_ROOT):
-        raise ValueError(
-            "Access outside the agent workspace is not allowed."
-        )
-
-    return resolved_path
 
 
 def execute_file_action(tool: str, target: str) -> dict:
@@ -93,10 +44,15 @@ def execute_file_action(tool: str, target: str) -> dict:
         )
 
     # Validate the source again at execution time.
-    source_path = resolve_workspace_path(
-        source_text,
-        must_exist=True,
-    )
+    try:
+        source_path = resolve_workspace_path(
+            source_text,
+            must_exist=True,
+        )
+    except FileNotFoundError as error:
+        raise ValueError(
+            "The source file does not exist."
+        ) from error
 
     if not source_path.is_file():
         raise ValueError(

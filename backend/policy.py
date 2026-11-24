@@ -1,8 +1,6 @@
 
 from dataclasses import dataclass
-from pathlib import Path
-
-from executor import WORKSPACE_ROOT, resolve_workspace_path
+from workspace_paths import WORKSPACE_ROOT, resolve_workspace_path
 
 
 # Tools that the policy engine permits.
