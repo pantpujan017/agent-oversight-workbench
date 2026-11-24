@@ -67,6 +67,7 @@ function App() {
   const [userInstruction, setUserInstruction] = useState("");
   const [proposalLoading, setProposalLoading] = useState(false);
   const [proposalError, setProposalError] = useState<string | null>(null);
+  const [proposalMessage, setProposalMessage] = useState<string | null>(null);
   const [actionsLoading, setActionsLoading] = useState(true);
   const [actionsError, setActionsError] = useState<string | null>(null);
 
@@ -131,7 +132,8 @@ function App() {
     }
 
     setProposalLoading(true);
-    setProposalError(null);
+setProposalError(null);
+setProposalMessage(null);
 
     try {
       const response = await fetch(
@@ -157,13 +159,15 @@ function App() {
 
       // Handle requests that need clarification.
 if (data.status === "needs_clarification") {
-  alert(data.message);
+  setProposalMessage(
+    data.message || "Please provide more details about your request."
+  );
   return;
 }
 
 // Handle duplicate proposals.
 if (data.status === "duplicate") {
-  alert("Duplicate action: " + data.message);
+  setProposalMessage(data.message);
   return;
 }
 
@@ -172,9 +176,9 @@ if (data.status === "duplicate") {
 
       setUserInstruction("");
 
-      alert(
-        "AI proposal created! Please review it in the approval queue."
-      );
+      setProposalMessage(
+  "AI proposal created! Please review it in the approval queue."
+);
 
     } catch (error) {
       setProposalError(
@@ -505,6 +509,19 @@ if (data.status === "duplicate") {
           {proposalError}
         </p>
       )}
+
+      {proposalMessage && (
+  <p
+    style={{
+      padding: "12px",
+      background: "#f3f4f6",
+      borderRadius: "8px",
+      color: "#374151",
+    }}
+  >
+    {proposalMessage}
+  </p>
+)}
 
       <button
         type="submit"
