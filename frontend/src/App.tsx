@@ -58,6 +58,8 @@ async function fetchExecutionLog(): Promise<ExecutionEntry[]> {
   return response.json();
 }
 
+
+
 function App() {
   const [backendStatus, setBackendStatus] = useState<
     "checking" | "connected" | "disconnected"
@@ -70,7 +72,7 @@ function App() {
   const [proposalMessage, setProposalMessage] = useState<string | null>(null);
   const [actionsLoading, setActionsLoading] = useState(true);
   const [actionsError, setActionsError] = useState<string | null>(null);
-
+  const [actionToConfirm, setActionToConfirm] = useState<number | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(true);
   const [auditError, setAuditError] = useState<string | null>(null);
@@ -524,14 +526,12 @@ if (data.status === "duplicate") {
 )}
 
       <button
-        type="submit"
-        className="approve-button"
-        disabled={proposalLoading || !userInstruction.trim()}
-      >
-        {proposalLoading
-          ? "Generating proposal..."
-          : "Generate AI Proposal"}
-      </button>
+  type="submit"
+  className="approve-button"
+  disabled={proposalLoading || !userInstruction.trim()}
+>
+  {proposalLoading ? "Generating proposal..." : "Generate AI Proposal"}
+</button>
     </form>
   </section>
 
@@ -591,6 +591,65 @@ if (data.status === "duplicate") {
                       </div>
                     </div>
 
+{actionToConfirm === action.id && (
+  <div
+    style={{
+      width: "100%",
+      padding: "16px",
+      background: "#f3f4f6",
+      border: "1px solid #d1d5db",
+      borderRadius: "10px",
+      marginBottom: "12px",
+      boxSizing: "border-box",
+    }}
+  >
+    <h3>Confirm file operation</h3>
+
+    <p>
+      <strong>Operation:</strong> {action.tool}
+    </p>
+
+    <p>
+      <strong>Requested file change:</strong>
+      <br />
+      {action.target}
+    </p>
+
+    <p>
+      This operation will modify files inside your
+      dedicated test workspace. Do you want to continue?
+    </p>
+
+    <div
+      style={{
+        display: "flex",
+        gap: "10px",
+        flexWrap: "wrap",
+      }}
+    >
+      <button
+        type="button"
+        className="reject-button"
+        onClick={() => setActionToConfirm(null)}
+      >
+        Cancel
+      </button>
+
+      <button
+        type="button"
+        className="approve-button"
+        onClick={() => {
+          setActionToConfirm(null);
+          void executeAction(action.id);
+        }}
+      >
+        Confirm Execution
+      </button>
+    </div>
+  </div>
+)}
+
+
                     <div className="action-buttons">
                       {action.status === "pending" && (
                         <>
@@ -611,14 +670,15 @@ if (data.status === "duplicate") {
                       )}
 
                       {action.status === "approved" &&
-                        action.execution_status === "not_started" && (
-                          <button
-                            className="approve-button"
-                            onClick={() => executeAction(action.id)}
-                          >
-                            Execute
-                          </button>
-                        )}
+  action.execution_status === "not_started" && (
+    <button
+      type="button"
+      className="approve-button"
+      onClick={() => setActionToConfirm(action.id)}
+    >
+      Review & Execute
+    </button>
+  )}
 
                       {action.execution_status === "running" && (
                         <span>Executing...</span>
