@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from executor import execute_file_action
 from ai_service import generate_action_proposal
+from policy import evaluate_action
 
 
 app = FastAPI(
@@ -229,6 +230,23 @@ def create_proposal(request: ProposalRequest):
             "proposal": proposal.model_dump(),
             "message": proposal.clarification_question,
         }
+
+    
+    # Independently check the AI proposal using backend policies.
+    policy_result = evaluate_action(
+        tool=proposal.tool,
+        source_text=proposal.source_path,
+        destination_text=proposal.destination_path,
+    )
+
+    # Block unsafe proposals before they enter the approval queue.
+    if not policy_result.allowed:
+        return {
+            "status": "policy_blocked",
+            "message": policy_result.reason,
+            "proposal": proposal.model_dump(),
+        }
+
 
     # Combine source and destination into the format
     # already understood by our file executor.

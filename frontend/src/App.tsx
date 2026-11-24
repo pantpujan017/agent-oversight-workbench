@@ -167,6 +167,14 @@ if (data.status === "needs_clarification") {
   return;
 }
 
+// Handle proposals blocked by backend policies.
+if (data.status === "policy_blocked") {
+  setProposalMessage(
+    "Policy blocked this proposal: " + data.message
+  );
+  return;
+}
+
 // Handle duplicate proposals.
 if (data.status === "duplicate") {
   setProposalMessage(data.message);
