@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from executor import execute_file_action
 from ai_service import generate_action_proposal
 from policy import evaluate_action
+from risk_assessment import assess_action_risk
 
 
 app = FastAPI(
@@ -91,6 +92,30 @@ def initialize_database():
                 ALTER TABLE actions
                 ADD COLUMN execution_message TEXT NOT NULL DEFAULT ''
             """)
+
+
+        # Add risk assessment columns when needed.
+        if "risk_level" not in columns:
+            connection.execute("""
+                ALTER TABLE actions
+                ADD COLUMN risk_level TEXT NOT NULL
+                DEFAULT 'unassessed'
+            """)
+
+        if "risk_reason" not in columns:
+            connection.execute("""
+                ALTER TABLE actions
+                ADD COLUMN risk_reason TEXT NOT NULL
+                DEFAULT ''
+            """)
+
+        if "review_recommendation" not in columns:
+            connection.execute("""
+                ALTER TABLE actions
+                ADD COLUMN review_recommendation TEXT NOT NULL
+                DEFAULT ''
+            """)
+
 
         # Decision history.
         connection.execute("""
@@ -246,6 +271,8 @@ def create_proposal(request: ProposalRequest):
             "message": policy_result.reason,
             "proposal": proposal.model_dump(),
         }
+    # Assess the risk of the permitted operation.
+    risk_result = assess_action_risk(proposal.tool)
 
 
     # Combine source and destination into the format
@@ -292,25 +319,31 @@ def create_proposal(request: ProposalRequest):
     with get_db_connection() as connection:
 
         cursor = connection.execute(
-            """
-            INSERT INTO actions (
-                title,
-                description,
-                tool,
-                target,
-                status,
-                execution_status,
-                execution_message
-            )
-            VALUES (?, ?, ?, ?, 'pending', 'not_started', '')
-            """,
-            (
-                proposal.title,
-                proposal.description,
-                proposal.tool,
-                target,
-            ),
-        )
+    """
+    INSERT INTO actions (
+        title,
+        description,
+        tool,
+        target,
+        status,
+        execution_status,
+        execution_message,
+        risk_level,
+        risk_reason,
+        review_recommendation
+    )
+    VALUES (?, ?, ?, ?, 'pending', 'not_started', '', ?, ?, ?)
+    """,
+    (
+        proposal.title,
+        proposal.description,
+        proposal.tool,
+        target,
+        risk_result.risk_level,
+        risk_result.reason,
+        risk_result.review_recommendation,
+    ),
+)
 
         action_id = cursor.lastrowid
 

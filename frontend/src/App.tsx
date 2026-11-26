@@ -15,6 +15,10 @@ type AgentAction = {
     | "completed"
     | "failed";
   execution_message: string;
+
+  risk_level: "low" | "medium" | "unassessed";
+  risk_reason: string;
+  review_recommendation: string;
 };
 
 type AuditEntry = {
@@ -597,6 +601,45 @@ if (data.status === "duplicate") {
                           <span>{action.execution_message}</span>
                         )}
                       </div>
+
+
+<div style={{ marginTop: "12px" }}>
+  <div
+    style={{
+      display: "inline-block",
+      padding: "5px 10px",
+      borderRadius: "6px",
+      fontSize: "12px",
+      fontWeight: 700,
+      background:
+        action.risk_level === "low"
+          ? "#dcfce7"
+          : action.risk_level === "medium"
+            ? "#fef3c7"
+            : "#e5e7eb",
+      color:
+        action.risk_level === "low"
+          ? "#166534"
+          : action.risk_level === "medium"
+            ? "#92400e"
+            : "#374151",
+    }}
+  >
+    RISK: {action.risk_level.toUpperCase()}
+  </div>
+
+  {action.risk_reason && (
+    <p>{action.risk_reason}</p>
+  )}
+
+  {action.review_recommendation && (
+    <p>
+      <strong>Review recommendation:</strong>{" "}
+      {action.review_recommendation}
+    </p>
+  )}
+</div>
+
                     </div>
 
 {actionToConfirm === action.id && (
