@@ -1,5 +1,10 @@
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { Session } from "@supabase/supabase-js";
+
+import Auth from "./Auth";
+import { supabase } from "./lib/supabaseClient";
+
 import "./App.css";
 
 type AgentAction = {
@@ -15,7 +20,6 @@ type AgentAction = {
     | "completed"
     | "failed";
   execution_message: string;
-
   risk_level: "low" | "medium" | "unassessed";
   risk_reason: string;
   review_recommendation: string;
@@ -40,43 +44,102 @@ type ExecutionEntry = {
   executed_at: string;
 };
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL =
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
-async function fetchAuditLog(): Promise<AuditEntry[]> {
-  const response = await fetch(`${API_URL}/audit-log`);
+// Every authenticated request must identify the user it belongs to.
+async function authenticatedFetch(
+  path: string,
+  options: RequestInit,
+  expectedUserId: string
+): Promise<Response> {
+  const { data, error } = await supabase.auth.getSession();
+
+  if (error) {
+    throw new Error("Could not read your login session.");
+  }
+
+  const accessToken = data.session?.access_token;
+  const currentUserId = data.session?.user.id;
+
+  if (!accessToken || !currentUserId) {
+    throw new Error(
+      "Your session has expired. Please sign in again."
+    );
+  }
+
+  // Never send an old user's request using another user's token.
+  if (currentUserId !== expectedUserId) {
+    throw new Error(
+      "Your account changed. Please try again."
+    );
+  }
+
+  const headers = new Headers(options.headers);
+
+  headers.set(
+    "Authorization",
+    `Bearer ${accessToken}`
+  );
+
+  return fetch(`${API_URL}${path}`, {
+    ...options,
+    headers,
+  });
+}
+
+async function fetchAuditLog(
+  expectedUserId: string
+): Promise<AuditEntry[]> {
+  const response = await authenticatedFetch(
+    "/audit-log",
+    {},
+    expectedUserId
+  );
 
   if (!response.ok) {
-    throw new Error("Could not load decision history");
+    throw new Error("Could not load decision history.");
   }
 
   return response.json();
 }
 
-async function fetchExecutionLog(): Promise<ExecutionEntry[]> {
-  const response = await fetch(`${API_URL}/execution-log`);
+async function fetchExecutionLog(
+  expectedUserId: string
+): Promise<ExecutionEntry[]> {
+  const response = await authenticatedFetch(
+    "/execution-log",
+    {},
+    expectedUserId
+  );
 
   if (!response.ok) {
-    throw new Error("Could not load execution history");
+    throw new Error("Could not load execution history.");
   }
 
   return response.json();
 }
-
-
 
 function App() {
   const [backendStatus, setBackendStatus] = useState<
     "checking" | "connected" | "disconnected"
   >("checking");
 
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [actions, setActions] = useState<AgentAction[]>([]);
   const [userInstruction, setUserInstruction] = useState("");
+
   const [proposalLoading, setProposalLoading] = useState(false);
   const [proposalError, setProposalError] = useState<string | null>(null);
   const [proposalMessage, setProposalMessage] = useState<string | null>(null);
+
   const [actionsLoading, setActionsLoading] = useState(true);
   const [actionsError, setActionsError] = useState<string | null>(null);
+
   const [actionToConfirm, setActionToConfirm] = useState<number | null>(null);
+
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(true);
   const [auditError, setAuditError] = useState<string | null>(null);
@@ -85,6 +148,102 @@ function App() {
   const [executionLoading, setExecutionLoading] = useState(true);
   const [executionError, setExecutionError] = useState<string | null>(null);
 
+  // Tracks the identity whose information is allowed in the dashboard.
+  const activeUserIdRef = useRef<string | null>(null);
+
+  // Prevents an older session-restoration request from overriding
+  // a newer authentication event.
+  const authEventReceivedRef = useRef(false);
+
+  const sessionUserId = session?.user.id ?? null;
+
+  // Apply an authentication change and clear account-specific state
+  // whenever the user identity changes.
+  const applySession = (newSession: Session | null) => {
+    const newUserId = newSession?.user.id ?? null;
+    const previousUserId = activeUserIdRef.current;
+
+    if (previousUserId !== newUserId) {
+      // Update the ref immediately, before asynchronous requests finish.
+      activeUserIdRef.current = newUserId;
+
+      // Remove all information belonging to the previous account.
+      setActions([]);
+      setAuditLogs([]);
+      setExecutionLogs([]);
+
+      setUserInstruction("");
+
+      setProposalLoading(false);
+      setProposalError(null);
+      setProposalMessage(null);
+
+      setActionsError(null);
+      setAuditError(null);
+      setExecutionError(null);
+
+      setActionToConfirm(null);
+
+      setActionsLoading(newUserId !== null);
+      setAuditLoading(newUserId !== null);
+      setExecutionLoading(newUserId !== null);
+    }
+
+    setSession(newSession);
+    setAuthLoading(false);
+  };
+
+  // Restore the Supabase session and listen for authentication changes.
+  useEffect(() => {
+    let active = true;
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      if (!active) return;
+
+      authEventReceivedRef.current = true;
+      applySession(newSession);
+    });
+
+    void supabase.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!active || authEventReceivedRef.current) return;
+
+        if (error) {
+          console.error(
+            "Could not restore Supabase session:",
+            error
+          );
+
+          applySession(null);
+        } else {
+          applySession(data.session);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!active || authEventReceivedRef.current) return;
+
+        console.error(
+          "Could not restore Supabase session:",
+          error
+        );
+
+        applySession(null);
+      })
+      .finally(() => {
+        if (active) {
+          setAuthLoading(false);
+        }
+      });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
   // Check backend connection.
   useEffect(() => {
     fetch(`${API_URL}/health`)
@@ -92,11 +251,14 @@ function App() {
         if (!response.ok) {
           throw new Error("Backend request failed");
         }
+
         return response.json();
       })
       .then((data: { status: string }) => {
         setBackendStatus(
-          data.status === "healthy" ? "connected" : "disconnected"
+          data.status === "healthy"
+            ? "connected"
+            : "disconnected"
         );
       })
       .catch(() => {
@@ -104,150 +266,237 @@ function App() {
       });
   }, []);
 
-  // Refresh actions from the backend.
-  const refreshActions = async () => {
-    const response = await fetch(`${API_URL}/actions`);
+  // Refresh actions, but only update the dashboard if the same
+  // user is still active when the response arrives.
+  const refreshActions = async (
+    expectedUserId: string
+  ): Promise<void> => {
+    const response = await authenticatedFetch(
+      "/actions",
+      {},
+      expectedUserId
+    );
 
     if (!response.ok) {
-      throw new Error("Could not load agent actions");
+      throw new Error("Could not load agent actions.");
     }
 
     const data: AgentAction[] = await response.json();
+
+    if (activeUserIdRef.current !== expectedUserId) {
+      return;
+    }
+
     setActions(data);
   };
 
-  // Refresh decision history.
-  const refreshAuditLogs = async () => {
-    const data = await fetchAuditLog();
+  const refreshAuditLogs = async (
+    expectedUserId: string
+  ): Promise<void> => {
+    const data = await fetchAuditLog(expectedUserId);
+
+    if (activeUserIdRef.current !== expectedUserId) {
+      return;
+    }
+
     setAuditLogs(data);
     setAuditError(null);
   };
 
-  // Refresh execution history.
-  const refreshExecutionLogs = async () => {
-    const data = await fetchExecutionLog();
+  const refreshExecutionLogs = async (
+    expectedUserId: string
+  ): Promise<void> => {
+    const data = await fetchExecutionLog(expectedUserId);
+
+    if (activeUserIdRef.current !== expectedUserId) {
+      return;
+    }
+
     setExecutionLogs(data);
     setExecutionError(null);
   };
 
-
   // Send a user instruction to Gemini.
   const createProposal = async () => {
-    if (!userInstruction.trim()) {
+    const expectedUserId = sessionUserId;
+
+    if (!expectedUserId || !userInstruction.trim()) {
       return;
     }
 
+    const instruction = userInstruction;
+
     setProposalLoading(true);
-setProposalError(null);
-setProposalMessage(null);
+    setProposalError(null);
+    setProposalMessage(null);
 
     try {
-      const response = await fetch(
-        `${API_URL}/proposals`,
+      const response = await authenticatedFetch(
+        "/proposals",
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            instruction: userInstruction,
+            instruction,
           }),
-        }
+        },
+        expectedUserId
       );
 
       const data = await response.json();
 
+      // Discard results from a previous account.
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(
-          data.detail || "Could not generate proposal"
+          data.detail || "Could not generate proposal."
         );
       }
 
-      // Handle requests that need clarification.
-if (data.status === "needs_clarification") {
-  setProposalMessage(
-    data.message || "Please provide more details about your request."
-  );
-  return;
-}
+      if (data.status === "needs_clarification") {
+        setProposalMessage(
+          data.message ||
+          "Please provide more details about your request."
+        );
+        return;
+      }
 
-// Handle proposals blocked by backend policies.
-if (data.status === "policy_blocked") {
-  setProposalMessage(
-    "Policy blocked this proposal: " + data.message
-  );
-  return;
-}
+      if (data.status === "policy_blocked") {
+        setProposalMessage(
+          "Policy blocked this proposal: " + data.message
+        );
+        return;
+      }
 
-// Handle duplicate proposals.
-if (data.status === "duplicate") {
-  setProposalMessage(data.message);
-  return;
-}
+      if (data.status === "duplicate") {
+        setProposalMessage(data.message);
+        return;
+      }
 
-      // Load the newly generated proposal into the approval queue.
-      await refreshActions();
+      await refreshActions(expectedUserId);
+
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
+      }
 
       setUserInstruction("");
 
       setProposalMessage(
-  "AI proposal created! Please review it in the approval queue."
-);
-
+        "AI proposal created! Please review it in the approval queue."
+      );
     } catch (error) {
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
+      }
+
       setProposalError(
         error instanceof Error
           ? error.message
-          : "Something went wrong"
+          : "Something went wrong."
       );
     } finally {
-      setProposalLoading(false);
+      if (activeUserIdRef.current === expectedUserId) {
+        setProposalLoading(false);
+      }
     }
   };
 
-
-  // Load all dashboard data.
+  // Load dashboard records after Supabase resolves the current account.
   useEffect(() => {
+    if (authLoading) return;
+
+    if (!sessionUserId) {
+      setActions([]);
+      setAuditLogs([]);
+      setExecutionLogs([]);
+
+      setActionsError(null);
+      setAuditError(null);
+      setExecutionError(null);
+
+      setActionsLoading(false);
+      setAuditLoading(false);
+      setExecutionLoading(false);
+
+      return;
+    }
+
+    const expectedUserId = sessionUserId;
+    let active = true;
+
+    const isCurrentUser = () =>
+      active &&
+      activeUserIdRef.current === expectedUserId;
+
     const loadDashboard = async () => {
+      setActionsLoading(true);
+      setAuditLoading(true);
+      setExecutionLoading(true);
+
+      setActionsError(null);
+      setAuditError(null);
+      setExecutionError(null);
+
       try {
-        await refreshActions();
+        await refreshActions(expectedUserId);
       } catch (error) {
-        setActionsError(
-          error instanceof Error
-            ? error.message
-            : "Could not load actions"
-        );
+        if (isCurrentUser()) {
+          setActionsError(
+            error instanceof Error
+              ? error.message
+              : "Could not load actions."
+          );
+        }
       } finally {
-        setActionsLoading(false);
+        if (isCurrentUser()) {
+          setActionsLoading(false);
+        }
       }
 
       try {
-        await refreshAuditLogs();
+        await refreshAuditLogs(expectedUserId);
       } catch (error) {
-        setAuditError(
-          error instanceof Error
-            ? error.message
-            : "Could not load decision history"
-        );
+        if (isCurrentUser()) {
+          setAuditError(
+            error instanceof Error
+              ? error.message
+              : "Could not load decision history."
+          );
+        }
       } finally {
-        setAuditLoading(false);
+        if (isCurrentUser()) {
+          setAuditLoading(false);
+        }
       }
 
       try {
-        await refreshExecutionLogs();
+        await refreshExecutionLogs(expectedUserId);
       } catch (error) {
-        setExecutionError(
-          error instanceof Error
-            ? error.message
-            : "Could not load execution history"
-        );
+        if (isCurrentUser()) {
+          setExecutionError(
+            error instanceof Error
+              ? error.message
+              : "Could not load execution history."
+          );
+        }
       } finally {
-        setExecutionLoading(false);
+        if (isCurrentUser()) {
+          setExecutionLoading(false);
+        }
       }
     };
 
-    loadDashboard();
-  }, []);
+    void loadDashboard();
+
+    return () => {
+      active = false;
+    };
+  }, [sessionUserId, authLoading]);
 
   const pendingCount = actions.filter(
     (action) => action.status === "pending"
@@ -258,36 +507,53 @@ if (data.status === "duplicate") {
     id: number,
     decision: "approved" | "rejected"
   ) => {
+    const expectedUserId = sessionUserId;
+
+    if (!expectedUserId) return;
+
     try {
-      const response = await fetch(
-        `${API_URL}/actions/${id}/decision`,
+      const response = await authenticatedFetch(
+        `/actions/${id}/decision`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ decision }),
-        }
+        },
+        expectedUserId
       );
 
       const data = await response.json();
 
-      if (!response.ok) {
-        throw new Error(data.detail || "Decision failed");
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
       }
 
-      setActions((currentActions) =>
-        currentActions.map((action) =>
-          action.id === id ? data.action : action
-        )
-      );
+      if (!response.ok) {
+        throw new Error(data.detail || "Decision failed.");
+      }
 
-      await refreshAuditLogs();
+      setActions((currentActions) => {
+        if (activeUserIdRef.current !== expectedUserId) {
+          return currentActions;
+        }
+
+        return currentActions.map((action) =>
+          action.id === id ? data.action : action
+        );
+      });
+
+      await refreshAuditLogs(expectedUserId);
     } catch (error) {
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
+      }
+
       alert(
         error instanceof Error
           ? error.message
-          : "Something went wrong"
+          : "Something went wrong."
       );
     }
   };
@@ -300,6 +566,10 @@ if (data.status === "duplicate") {
 
   // Execute an approved file operation.
   const executeAction = async (id: number) => {
+    const expectedUserId = sessionUserId;
+
+    if (!expectedUserId) return;
+
     setActions((currentActions) =>
       currentActions.map((action) =>
         action.id === id
@@ -309,44 +579,107 @@ if (data.status === "duplicate") {
     );
 
     try {
-      const response = await fetch(
-        `${API_URL}/actions/${id}/execute`,
+      const response = await authenticatedFetch(
+        `/actions/${id}/execute`,
         {
           method: "POST",
-        }
+        },
+        expectedUserId
       );
 
       const data = await response.json();
 
-      if (!response.ok) {
-        throw new Error(data.detail || "Execution failed");
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
       }
 
-      setActions((currentActions) =>
-        currentActions.map((action) =>
+      if (!response.ok) {
+        throw new Error(data.detail || "Execution failed.");
+      }
+
+      setActions((currentActions) => {
+        if (activeUserIdRef.current !== expectedUserId) {
+          return currentActions;
+        }
+
+        return currentActions.map((action) =>
           action.id === id ? data.action : action
-        )
-      );
+        );
+      });
 
-      await refreshExecutionLogs();
+      await refreshExecutionLogs(expectedUserId);
 
-      alert("File operation completed successfully!");
+      if (activeUserIdRef.current === expectedUserId) {
+        alert("File operation completed successfully!");
+      }
     } catch (error) {
-      // Reload the latest status, including failed executions.
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
+      }
+
+      // Reload the latest execution status for the same user.
       try {
-        await refreshActions();
-        await refreshExecutionLogs();
+        await refreshActions(expectedUserId);
+        await refreshExecutionLogs(expectedUserId);
       } catch {
         // Preserve the original execution error.
+      }
+
+      if (activeUserIdRef.current !== expectedUserId) {
+        return;
       }
 
       alert(
         error instanceof Error
           ? error.message
-          : "Something went wrong"
+          : "Something went wrong."
       );
     }
   };
+
+  const handleSignOut = async () => {
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      alert(`Could not sign out: ${error.message}`);
+    }
+
+    // The authentication listener clears the previous user's data.
+  };
+
+  if (authLoading) {
+    return (
+      <div
+        className="auth-loading"
+        role="status"
+        aria-live="polite"
+      >
+        Checking your account...
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <Auth
+        onAuthenticated={() => {
+          void supabase.auth
+            .getSession()
+            .then(({ data, error }) => {
+              if (error) {
+                console.error(
+                  "Could not load authenticated session:",
+                  error
+                );
+                return;
+              }
+
+              applySession(data.session);
+            });
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -395,10 +728,24 @@ if (data.status === "duplicate") {
           </div>
 
           <div className="profile">
-            <div className="avatar">PP</div>
-            <div>
-              <strong>Workspace Owner</strong>
-              <span>Administrator</span>
+            <div className="avatar">
+              {(session.user.email?.[0] || "U").toUpperCase()}
+            </div>
+
+            <div className="profile-details">
+              <strong>
+                {session.user.email || "Signed-in user"}
+              </strong>
+
+              <span>Individual account</span>
+
+              <button
+                type="button"
+                onClick={() => void handleSignOut()}
+                className="sign-out-button"
+              >
+                Sign out
+              </button>
             </div>
           </div>
         </div>
@@ -414,6 +761,7 @@ if (data.status === "duplicate") {
             <span className="environment-tag">
               LOCAL ENVIRONMENT
             </span>
+
             <div className="avatar small-avatar">PP</div>
           </div>
         </header>
@@ -423,6 +771,7 @@ if (data.status === "duplicate") {
             <div>
               <span className="eyebrow">AGENT MONITORING</span>
               <h1>Overview</h1>
+
               <p>
                 Monitor agent activity, review proposed actions
                 and stay in control of execution.
@@ -445,7 +794,9 @@ if (data.status === "duplicate") {
             <div className="stat-card">
               <span className="stat-label">ACTIVE AGENTS</span>
               <strong>1</strong>
-              <span className="stat-description">Demo agent</span>
+              <span className="stat-description">
+                Demo agent
+              </span>
             </div>
 
             <div className="stat-card">
@@ -459,7 +810,9 @@ if (data.status === "duplicate") {
             <div className="stat-card">
               <span className="stat-label">APPROVED ACTIONS</span>
               <strong>
-                {actions.filter((a) => a.status === "approved").length}
+                {actions.filter(
+                  (action) => action.status === "approved"
+                ).length}
               </strong>
               <span className="stat-description">
                 Saved in database
@@ -469,7 +822,9 @@ if (data.status === "duplicate") {
             <div className="stat-card">
               <span className="stat-label">REJECTED ACTIONS</span>
               <strong>
-                {actions.filter((a) => a.status === "rejected").length}
+                {actions.filter(
+                  (action) => action.status === "rejected"
+                ).length}
               </strong>
               <span className="stat-description">
                 Saved in database
@@ -477,76 +832,80 @@ if (data.status === "duplicate") {
             </div>
           </section>
 
+          {/* AI instruction panel */}
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <span className="eyebrow">AI ASSISTANT</span>
+                <h2>Create an action with AI</h2>
 
-  {/* AI instruction panel */}
-  <section className="panel">
-    <div className="panel-header">
-      <div>
-        <span className="eyebrow">AI ASSISTANT</span>
-        <h2>Create an action with AI</h2>
-        <p>
-          Describe what you want the agent to do.
-          Gemini will generate a proposal for your approval.
-        </p>
-      </div>
-    </div>
+                <p>
+                  Describe what you want the agent to do.
+                  Gemini will generate a proposal for your approval.
+                </p>
+              </div>
+            </div>
 
-    <form
-      onSubmit={(event) => {
-        event.preventDefault();
-        void createProposal();
-      }}
-    >
-      <textarea
-        value={userInstruction}
-        onChange={(event) =>
-          setUserInstruction(event.target.value)
-        }
-        placeholder="Example: Copy the project plan into the archive folder."
-        rows={4}
-        maxLength={2000}
-        disabled={proposalLoading}
-        style={{
-          width: "100%",
-          padding: "14px",
-          border: "1px solid #d1d5db",
-          borderRadius: "8px",
-          resize: "vertical",
-          font: "inherit",
-          boxSizing: "border-box",
-          marginBottom: "12px",
-        }}
-      />
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createProposal();
+              }}
+            >
+              <textarea
+                value={userInstruction}
+                onChange={(event) =>
+                  setUserInstruction(event.target.value)
+                }
+                placeholder="Example: Copy the project plan into the archive folder."
+                rows={4}
+                maxLength={2000}
+                disabled={proposalLoading}
+                style={{
+                  width: "100%",
+                  padding: "14px",
+                  border: "1px solid #d1d5db",
+                  borderRadius: "8px",
+                  resize: "vertical",
+                  font: "inherit",
+                  boxSizing: "border-box",
+                  marginBottom: "12px",
+                }}
+              />
 
-      {proposalError && (
-        <p style={{ color: "red" }}>
-          {proposalError}
-        </p>
-      )}
+              {proposalError && (
+                <p style={{ color: "red" }}>
+                  {proposalError}
+                </p>
+              )}
 
-      {proposalMessage && (
-  <p
-    style={{
-      padding: "12px",
-      background: "#f3f4f6",
-      borderRadius: "8px",
-      color: "#374151",
-    }}
-  >
-    {proposalMessage}
-  </p>
-)}
+              {proposalMessage && (
+                <p
+                  style={{
+                    padding: "12px",
+                    background: "#f3f4f6",
+                    borderRadius: "8px",
+                    color: "#374151",
+                  }}
+                >
+                  {proposalMessage}
+                </p>
+              )}
 
-      <button
-  type="submit"
-  className="approve-button"
-  disabled={proposalLoading || !userInstruction.trim()}
->
-  {proposalLoading ? "Generating proposal..." : "Generate AI Proposal"}
-</button>
-    </form>
-  </section>
-
+              <button
+                type="submit"
+                className="approve-button"
+                disabled={
+                  proposalLoading ||
+                  !userInstruction.trim()
+                }
+              >
+                {proposalLoading
+                  ? "Generating proposal..."
+                  : "Generate AI Proposal"}
+              </button>
+            </form>
+          </section>
 
           {/* Approval queue */}
           <section className="panel" id="approval-queue">
@@ -554,7 +913,9 @@ if (data.status === "duplicate") {
               <div>
                 <span className="eyebrow">HUMAN OVERSIGHT</span>
                 <h2>Action approval queue</h2>
-                <p>Review each action before it can proceed.</p>
+                <p>
+                  Review each action before it can proceed.
+                </p>
               </div>
 
               <span className="queue-count">
@@ -563,10 +924,14 @@ if (data.status === "duplicate") {
             </div>
 
             <div className="action-list">
-              {actionsLoading && <p>Loading agent actions...</p>}
+              {actionsLoading && (
+                <p>Loading agent actions...</p>
+              )}
 
               {actionsError && (
-                <p style={{ color: "red" }}>{actionsError}</p>
+                <p style={{ color: "red" }}>
+                  {actionsError}
+                </p>
               )}
 
               {!actionsLoading &&
@@ -597,123 +962,127 @@ if (data.status === "duplicate") {
                             .replace("_", " ")
                             .toUpperCase()}
                         </span>
+
                         {action.execution_message && (
                           <span>{action.execution_message}</span>
                         )}
                       </div>
 
+                      <div style={{ marginTop: "12px" }}>
+                        <div
+                          style={{
+                            display: "inline-block",
+                            padding: "5px 10px",
+                            borderRadius: "6px",
+                            fontSize: "12px",
+                            fontWeight: 700,
+                            background:
+                              action.risk_level === "low"
+                                ? "#dcfce7"
+                                : action.risk_level === "medium"
+                                  ? "#fef3c7"
+                                  : "#e5e7eb",
+                            color:
+                              action.risk_level === "low"
+                                ? "#166534"
+                                : action.risk_level === "medium"
+                                  ? "#92400e"
+                                  : "#374151",
+                          }}
+                        >
+                          RISK: {action.risk_level.toUpperCase()}
+                        </div>
 
-<div style={{ marginTop: "12px" }}>
-  <div
-    style={{
-      display: "inline-block",
-      padding: "5px 10px",
-      borderRadius: "6px",
-      fontSize: "12px",
-      fontWeight: 700,
-      background:
-        action.risk_level === "low"
-          ? "#dcfce7"
-          : action.risk_level === "medium"
-            ? "#fef3c7"
-            : "#e5e7eb",
-      color:
-        action.risk_level === "low"
-          ? "#166534"
-          : action.risk_level === "medium"
-            ? "#92400e"
-            : "#374151",
-    }}
-  >
-    RISK: {action.risk_level.toUpperCase()}
-  </div>
+                        {action.risk_reason && (
+                          <p>{action.risk_reason}</p>
+                        )}
 
-  {action.risk_reason && (
-    <p>{action.risk_reason}</p>
-  )}
-
-  {action.review_recommendation && (
-    <p>
-      <strong>Review recommendation:</strong>{" "}
-      {action.review_recommendation}
-    </p>
-  )}
-</div>
-
+                        {action.review_recommendation && (
+                          <p>
+                            <strong>Review recommendation:</strong>{" "}
+                            {action.review_recommendation}
+                          </p>
+                        )}
+                      </div>
                     </div>
 
-{actionToConfirm === action.id && (
-  <div
-    style={{
-      width: "100%",
-      padding: "16px",
-      background: "#f3f4f6",
-      border: "1px solid #d1d5db",
-      borderRadius: "10px",
-      marginBottom: "12px",
-      boxSizing: "border-box",
-    }}
-  >
-    <h3>Confirm file operation</h3>
+                    {actionToConfirm === action.id && (
+                      <div
+                        style={{
+                          width: "100%",
+                          padding: "16px",
+                          background: "#f3f4f6",
+                          border: "1px solid #d1d5db",
+                          borderRadius: "10px",
+                          marginBottom: "12px",
+                          boxSizing: "border-box",
+                        }}
+                      >
+                        <h3>Confirm file operation</h3>
 
-    <p>
-      <strong>Operation:</strong> {action.tool}
-    </p>
+                        <p>
+                          <strong>Operation:</strong>{" "}
+                          {action.tool}
+                        </p>
 
-    <p>
-      <strong>Requested file change:</strong>
-      <br />
-      {action.target}
-    </p>
+                        <p>
+                          <strong>Requested file change:</strong>
+                          <br />
+                          {action.target}
+                        </p>
 
-    <p>
-      This operation will modify files inside your
-      dedicated test workspace. Do you want to continue?
-    </p>
+                        <p>
+                          This operation will modify files inside your
+                          dedicated test workspace. Do you want to
+                          continue?
+                        </p>
 
-    <div
-      style={{
-        display: "flex",
-        gap: "10px",
-        flexWrap: "wrap",
-      }}
-    >
-      <button
-        type="button"
-        className="reject-button"
-        onClick={() => setActionToConfirm(null)}
-      >
-        Cancel
-      </button>
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: "10px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <button
+                            type="button"
+                            className="reject-button"
+                            onClick={() => setActionToConfirm(null)}
+                          >
+                            Cancel
+                          </button>
 
-      <button
-        type="button"
-        className="approve-button"
-        onClick={() => {
-          setActionToConfirm(null);
-          void executeAction(action.id);
-        }}
-      >
-        Confirm Execution
-      </button>
-    </div>
-  </div>
-)}
-
+                          <button
+                            type="button"
+                            className="approve-button"
+                            onClick={() => {
+                              setActionToConfirm(null);
+                              void executeAction(action.id);
+                            }}
+                          >
+                            Confirm Execution
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     <div className="action-buttons">
                       {action.status === "pending" && (
                         <>
                           <button
                             className="reject-button"
-                            onClick={() => rejectAction(action.id)}
+                            onClick={() =>
+                              void rejectAction(action.id)
+                            }
                           >
                             Reject
                           </button>
 
                           <button
                             className="approve-button"
-                            onClick={() => approveAction(action.id)}
+                            onClick={() =>
+                              void approveAction(action.id)
+                            }
                           >
                             Approve
                           </button>
@@ -721,15 +1090,17 @@ if (data.status === "duplicate") {
                       )}
 
                       {action.status === "approved" &&
-  action.execution_status === "not_started" && (
-    <button
-      type="button"
-      className="approve-button"
-      onClick={() => setActionToConfirm(action.id)}
-    >
-      Review & Execute
-    </button>
-  )}
+                        action.execution_status === "not_started" && (
+                          <button
+                            type="button"
+                            className="approve-button"
+                            onClick={() =>
+                              setActionToConfirm(action.id)
+                            }
+                          >
+                            Review & Execute
+                          </button>
+                        )}
 
                       {action.execution_status === "running" && (
                         <span>Executing...</span>
@@ -745,7 +1116,9 @@ if (data.status === "duplicate") {
                   <div className="empty-state">
                     <span>✓</span>
                     <h3>All actions reviewed</h3>
-                    <p>No pending approvals remain in this demo.</p>
+                    <p>
+                      No pending approvals remain in this demo.
+                    </p>
                   </div>
                 )}
             </div>
@@ -770,10 +1143,14 @@ if (data.status === "duplicate") {
             </div>
 
             <div className="action-list">
-              {auditLoading && <p>Loading decision history...</p>}
+              {auditLoading && (
+                <p>Loading decision history...</p>
+              )}
 
               {auditError && (
-                <p style={{ color: "red" }}>{auditError}</p>
+                <p style={{ color: "red" }}>
+                  {auditError}
+                </p>
               )}
 
               {!auditLoading &&
@@ -810,8 +1187,10 @@ if (data.status === "duplicate") {
                         <span>
                           DECISION: {entry.decision.toUpperCase()}
                         </span>
+
                         <span>
-                          TIME: {new Date(entry.decided_at).toLocaleString()}
+                          TIME:{" "}
+                          {new Date(entry.decided_at).toLocaleString()}
                         </span>
                       </div>
                     </div>
@@ -844,7 +1223,9 @@ if (data.status === "duplicate") {
               )}
 
               {executionError && (
-                <p style={{ color: "red" }}>{executionError}</p>
+                <p style={{ color: "red" }}>
+                  {executionError}
+                </p>
               )}
 
               {!executionLoading &&
@@ -876,13 +1257,16 @@ if (data.status === "duplicate") {
                       </div>
 
                       <p>
-                        Tool: {entry.tool} | Action ID: {entry.action_id}
+                        Tool: {entry.tool} | Action ID:{" "}
+                        {entry.action_id}
                       </p>
 
                       <div className="action-metadata">
                         <span>TARGET: {entry.target}</span>
+
                         <span>
-                          TIME: {new Date(entry.executed_at).toLocaleString()}
+                          TIME:{" "}
+                          {new Date(entry.executed_at).toLocaleString()}
                         </span>
                       </div>
 

@@ -1,6 +1,11 @@
 
 from dataclasses import dataclass
-from workspace_paths import WORKSPACE_ROOT, resolve_workspace_path
+from pathlib import Path
+
+from workspace_paths import (
+    WORKSPACE_ROOT,
+    resolve_workspace_path,
+)
 
 
 # Tools that the policy engine permits.
@@ -22,12 +27,15 @@ def evaluate_action(
     tool: str,
     source_text: str,
     destination_text: str,
+    workspace_root: Path | None = None,
 ) -> PolicyResult:
     """
     Independently evaluate a proposed file operation.
 
-    This function only checks the operation.
-    It does not execute or modify any files.
+    Accepts an optional workspace_root so each authenticated
+    user can be checked against their own private workspace.
+
+    When omitted, the existing legacy workspace is used.
     """
 
     # Rule 1: Only approved tool types are permitted.
@@ -38,6 +46,11 @@ def evaluate_action(
         )
 
     try:
+        root = Path(
+            workspace_root if workspace_root is not None
+            else WORKSPACE_ROOT
+        ).resolve()
+
         source_text = source_text.strip()
         destination_text = destination_text.strip()
 
@@ -48,10 +61,11 @@ def evaluate_action(
                 reason="Source and destination paths are required.",
             )
 
-        # Rule 3: Source must exist inside the workspace.
+        # Rule 3: Source must exist inside the selected workspace.
         source_path = resolve_workspace_path(
             source_text,
             must_exist=True,
+            workspace_root=root,
         )
 
         if not source_path.is_file():
@@ -68,6 +82,7 @@ def evaluate_action(
         destination_path = resolve_workspace_path(
             destination_text,
             must_exist=False,
+            workspace_root=root,
         )
 
         # Rule 5: Rename must specify a filename.
@@ -98,7 +113,7 @@ def evaluate_action(
         destination_path = destination_path.resolve()
 
         # Rule 6: Confirm the resolved destination is safe.
-        if not destination_path.is_relative_to(WORKSPACE_ROOT):
+        if not destination_path.is_relative_to(root):
             return PolicyResult(
                 allowed=False,
                 reason="Access outside the workspace is not allowed.",
@@ -127,9 +142,7 @@ def evaluate_action(
 
         # All policy checks passed.
         normalized_destination = (
-            destination_path.relative_to(
-                WORKSPACE_ROOT
-            ).as_posix()
+            destination_path.relative_to(root).as_posix()
         )
 
         return PolicyResult(

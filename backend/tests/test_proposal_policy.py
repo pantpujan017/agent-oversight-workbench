@@ -55,19 +55,30 @@ def test_backend_policy_blocks_unsafe_ai_proposal(
         clarification_question="",
     )
 
+    test_user = {
+    "id": "test-user-123"
+}
+
+    monkeypatch.setattr(
+    main,
+    "get_user_workspace_root",
+    lambda user_id: tmp_path,
+)
+
     # Replace Gemini with our controlled proposal.
     monkeypatch.setattr(
         main,
         "generate_action_proposal",
-        lambda instruction: unsafe_proposal,
+        lambda instruction, workspace_root=None: unsafe_proposal
     )
 
     # Submit the proposal through the actual backend route.
     result = main.create_proposal(
-        main.ProposalRequest(
-            instruction="Copy the project plan outside the workspace."
-        )
-    )
+    main.ProposalRequest(
+        instruction="Copy the project plan outside the workspace."
+    ),
+    current_user=test_user,
+)
 
     # Confirm that the independent policy blocks it.
     assert result["status"] == "policy_blocked"

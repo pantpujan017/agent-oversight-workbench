@@ -19,6 +19,16 @@ def test_new_proposal_saves_risk_information(
 
     (project / "plan.txt").write_text("Test content")
 
+    test_user = {
+    "id": "test-user-123"
+}
+
+    monkeypatch.setattr(
+    main,
+    "get_user_workspace_root",
+    lambda user_id: tmp_path,
+)
+
     # Redirect workspace validation.
     monkeypatch.setattr(
         workspace_paths,
@@ -55,15 +65,16 @@ def test_new_proposal_saves_risk_information(
     monkeypatch.setattr(
         main,
         "generate_action_proposal",
-        lambda instruction: proposal,
+        lambda instruction, workspace_root=None: proposal
     )
 
     # Submit the proposal through the backend.
     result = main.create_proposal(
-        main.ProposalRequest(
-            instruction="Copy the project plan."
-        )
-    )
+    main.ProposalRequest(
+        instruction="Copy the project plan."
+    ),
+    current_user=test_user,
+)
 
     assert result["status"] == "pending_approval"
 

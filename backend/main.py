@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -13,6 +13,8 @@ from executor import execute_file_action
 from ai_service import generate_action_proposal
 from policy import evaluate_action
 from risk_assessment import assess_action_risk
+from auth import get_current_user
+from workspace_paths import get_user_workspace_root
 
 
 app = FastAPI(
@@ -27,7 +29,7 @@ app.add_middleware(
     allow_origins=["http://localhost:5173"],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -115,6 +117,22 @@ def initialize_database():
                 ADD COLUMN review_recommendation TEXT NOT NULL
                 DEFAULT ''
             """)
+
+
+        # Add user ownership to existing actions.
+        # Historical records remain unassigned.
+        if "user_id" not in columns:
+            connection.execute("""
+                ALTER TABLE actions
+                ADD COLUMN user_id TEXT
+            """)
+
+        # Improve queries that retrieve actions by owner.
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_actions_user_id
+            ON actions(user_id)
+        """)
+
 
 
         # Decision history.
@@ -215,10 +233,18 @@ def health_check():
 
 # Get all actions from SQLite.
 @app.get("/actions")
-def get_actions():
+def get_actions(
+    current_user: dict = Depends(get_current_user),
+):
     with get_db_connection() as connection:
         rows = connection.execute(
-            "SELECT * FROM actions ORDER BY id"
+            """
+            SELECT *
+            FROM actions
+            WHERE user_id = ?
+            ORDER BY id
+            """,
+            (current_user["id"],),
         ).fetchall()
 
     return [dict(row) for row in rows]
@@ -226,13 +252,22 @@ def get_actions():
 
 # Generate an AI proposal and add it to the approval queue.
 @app.post("/proposals")
-def create_proposal(request: ProposalRequest):
+def create_proposal(
+    request: ProposalRequest,
+    current_user: dict = Depends(get_current_user),
+):
+
+    # Get the private workspace belonging to the authenticated user.
+    workspace_root = get_user_workspace_root(
+    current_user["id"]
+)
 
     # Ask Gemini to interpret the user's instruction.
     try:
         proposal = generate_action_proposal(
-            request.instruction
-        )
+    request.instruction,
+    workspace_root=workspace_root,
+)
 
     except ValueError as error:
         raise HTTPException(
@@ -259,10 +294,11 @@ def create_proposal(request: ProposalRequest):
     
     # Independently check the AI proposal using backend policies.
     policy_result = evaluate_action(
-        tool=proposal.tool,
-        source_text=proposal.source_path,
-        destination_text=proposal.destination_path,
-    )
+    tool=proposal.tool,
+    source_text=proposal.source_path,
+    destination_text=proposal.destination_path,
+    workspace_root=workspace_root,
+)
 
     # Block unsafe proposals before they enter the approval queue.
     if not policy_result.allowed:
@@ -289,19 +325,20 @@ def create_proposal(request: ProposalRequest):
         existing_action = connection.execute(
             """
             SELECT * FROM actions
-            WHERE tool = ?
-              AND TRIM(target) = ?
-              AND (
-                  status = 'pending'
-                  OR (
-                      status = 'approved'
-                      AND execution_status IN ('not_started', 'running')
-                  )
-              )
-            ORDER BY id
-            LIMIT 1
+WHERE user_id = ?
+  AND tool = ?
+  AND TRIM(target) = ?
+  AND (
+      status = 'pending'
+      OR (
+          status = 'approved'
+          AND execution_status IN ('not_started', 'running')
+      )
+  )
+ORDER BY id
+LIMIT 1
             """,
-            (proposal.tool, target),
+            (current_user["id"], proposal.tool, target),
         ).fetchone()
 
         if existing_action is not None:
@@ -321,6 +358,7 @@ def create_proposal(request: ProposalRequest):
         cursor = connection.execute(
     """
     INSERT INTO actions (
+        user_id,
         title,
         description,
         tool,
@@ -332,9 +370,10 @@ def create_proposal(request: ProposalRequest):
         risk_reason,
         review_recommendation
     )
-    VALUES (?, ?, ?, ?, 'pending', 'not_started', '', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, 'pending', 'not_started', '', ?, ?, ?)
     """,
     (
+        current_user["id"],
         proposal.title,
         proposal.description,
         proposal.tool,
@@ -361,14 +400,23 @@ def create_proposal(request: ProposalRequest):
 
 
 # Approve or reject an action and record the decision.
-@app.post("/actions/{action_id}/decision")
-def decide_action(action_id: int, request: DecisionRequest):
 
+@app.post("/actions/{action_id}/decision")
+def decide_action(
+    action_id: int,
+    request: DecisionRequest,
+    current_user: dict = Depends(get_current_user),
+):
     with get_db_connection() as connection:
 
+        # Only retrieve an action owned by this user.
         action = connection.execute(
-            "SELECT * FROM actions WHERE id = ?",
-            (action_id,),
+            """
+            SELECT *
+            FROM actions
+            WHERE id = ? AND user_id = ?
+            """,
+            (action_id, current_user["id"]),
         ).fetchone()
 
         if action is None:
@@ -384,25 +432,40 @@ def decide_action(action_id: int, request: DecisionRequest):
             )
 
         connection.execute(
-            "UPDATE actions SET status = ? WHERE id = ?",
-            (request.decision, action_id),
+            """
+            UPDATE actions
+            SET status = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                request.decision,
+                action_id,
+                current_user["id"],
+            ),
         )
 
         connection.execute(
             """
-            INSERT INTO audit_log (action_id, decision, decided_at)
+            INSERT INTO audit_log
+            (action_id, decision, decided_at)
             VALUES (?, ?, ?)
             """,
             (
                 action_id,
                 request.decision,
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
             ),
         )
 
         updated_action = connection.execute(
-            "SELECT * FROM actions WHERE id = ?",
-            (action_id,),
+            """
+            SELECT *
+            FROM actions
+            WHERE id = ? AND user_id = ?
+            """,
+            (action_id, current_user["id"]),
         ).fetchone()
 
     return {
@@ -411,11 +474,16 @@ def decide_action(action_id: int, request: DecisionRequest):
     }
 
 
+
 # Get approval and rejection history.
+
 @app.get("/audit-log")
-def get_audit_log():
+def get_audit_log(
+    current_user: dict = Depends(get_current_user),
+):
     with get_db_connection() as connection:
-        rows = connection.execute("""
+        rows = connection.execute(
+            """
             SELECT
                 audit_log.id,
                 audit_log.action_id,
@@ -424,22 +492,36 @@ def get_audit_log():
                 audit_log.decided_at
             FROM audit_log
             JOIN actions ON actions.id = audit_log.action_id
+            WHERE actions.user_id = ?
             ORDER BY audit_log.id DESC
-        """).fetchall()
+            """,
+            (current_user["id"],),
+        ).fetchall()
 
     return [dict(row) for row in rows]
 
 
-# Execute an action only after human approval.
-@app.post("/actions/{action_id}/execute")
-def execute_approved_action(action_id: int):
 
-    # First check the approval status and reserve the action.
+# Execute an action only after human approval.
+
+@app.post("/actions/{action_id}/execute")
+def execute_approved_action(
+    action_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    # Resolve the workspace belonging to the authenticated user.
+    workspace_root = get_user_workspace_root(current_user["id"])
+
+    # Check ownership and reserve the action before execution.
     with get_db_connection() as connection:
 
         action = connection.execute(
-            "SELECT * FROM actions WHERE id = ?",
-            (action_id,),
+            """
+            SELECT *
+            FROM actions
+            WHERE id = ? AND user_id = ?
+            """,
+            (action_id, current_user["id"]),
         ).fetchone()
 
         if action is None:
@@ -465,10 +547,11 @@ def execute_approved_action(action_id: int):
             UPDATE actions
             SET execution_status = 'running'
             WHERE id = ?
+              AND user_id = ?
               AND status = 'approved'
               AND execution_status = 'not_started'
             """,
-            (action_id,),
+            (action_id, current_user["id"]),
         )
 
         if cursor.rowcount != 1:
@@ -479,11 +562,12 @@ def execute_approved_action(action_id: int):
 
         action_data = dict(action)
 
-    # Now perform the approved file operation.
+    # Execute only inside this user's private workspace.
     try:
         result = execute_file_action(
             action_data["tool"],
             action_data["target"],
+            workspace_root=workspace_root,
         )
 
     except Exception as error:
@@ -497,9 +581,9 @@ def execute_approved_action(action_id: int):
                 UPDATE actions
                 SET execution_status = 'failed',
                     execution_message = ?
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (error_message, action_id),
+                (error_message, action_id, current_user["id"]),
             )
 
             connection.execute(
@@ -530,9 +614,13 @@ def execute_approved_action(action_id: int):
             UPDATE actions
             SET execution_status = 'completed',
                 execution_message = ?
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (result["message"], action_id),
+            (
+                result["message"],
+                action_id,
+                current_user["id"],
+            ),
         )
 
         connection.execute(
@@ -551,8 +639,12 @@ def execute_approved_action(action_id: int):
         )
 
         updated_action = connection.execute(
-            "SELECT * FROM actions WHERE id = ?",
-            (action_id,),
+            """
+            SELECT *
+            FROM actions
+            WHERE id = ? AND user_id = ?
+            """,
+            (action_id, current_user["id"]),
         ).fetchone()
 
     return {
@@ -562,11 +654,16 @@ def execute_approved_action(action_id: int):
     }
 
 
+
 # Get file execution history.
+
 @app.get("/execution-log")
-def get_execution_log():
+def get_execution_log(
+    current_user: dict = Depends(get_current_user),
+):
     with get_db_connection() as connection:
-        rows = connection.execute("""
+        rows = connection.execute(
+            """
             SELECT
                 execution_log.id,
                 execution_log.action_id,
@@ -578,7 +675,10 @@ def get_execution_log():
                 execution_log.executed_at
             FROM execution_log
             JOIN actions ON actions.id = execution_log.action_id
+            WHERE actions.user_id = ?
             ORDER BY execution_log.id DESC
-        """).fetchall()
+            """,
+            (current_user["id"],),
+        ).fetchall()
 
     return [dict(row) for row in rows]

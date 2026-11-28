@@ -72,17 +72,28 @@ def test_medium_risk_is_saved_with_proposal(
         clarification_question="",
     )
 
+    test_user = {
+    "id": "test-user-123"
+}
+
+    monkeypatch.setattr(
+    main,
+    "get_user_workspace_root",
+    lambda user_id: tmp_path,
+)
+
     monkeypatch.setattr(
         main,
         "generate_action_proposal",
-        lambda instruction: proposal,
+        lambda instruction, workspace_root=None: proposal
     )
 
     result = main.create_proposal(
-        main.ProposalRequest(
-            instruction=f"Test {tool}."
-        )
-    )
+    main.ProposalRequest(
+        instruction=f"Test {tool}."
+    ),
+    current_user=test_user,
+)
 
     assert result["status"] == "pending_approval"
 

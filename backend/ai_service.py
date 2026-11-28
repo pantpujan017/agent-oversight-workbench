@@ -61,7 +61,7 @@ Supported tools:
 Security rules:
 - NEVER execute file operations.
 - NEVER claim that a file has been modified.
-- All paths must be relative to agent_workspace.
+- All paths must be relative to the assigned user workspace.
 - Never use absolute paths or paths containing '..'.
 - Never invent source filenames or folder names.
 - Use only exact source filenames and existing directories supplied in the workspace inventory.
@@ -90,29 +90,37 @@ A human must approve every proposal before execution.
 """
 
 
-
-def get_workspace_inventory():
+def get_workspace_inventory(
+    workspace_root: Path | None = None,
+):
     """
-    List files and folders currently available
-    inside the dedicated agent workspace.
+    List files and folders available inside the selected workspace.
+
+    If a user workspace is provided, inventory is restricted
+    to that workspace. Otherwise, use the legacy workspace.
     """
 
-    if not WORKSPACE_ROOT.is_dir():
+    root = Path(
+        workspace_root if workspace_root is not None
+        else WORKSPACE_ROOT
+    ).resolve()
+
+    if not root.is_dir():
         raise RuntimeError("Agent workspace folder does not exist.")
 
     files = []
     directories = []
 
-    for item in WORKSPACE_ROOT.rglob("*"):
+    for item in root.rglob("*"):
 
         resolved = item.resolve()
 
         # Ignore symbolic links that point outside the workspace.
-        if not resolved.is_relative_to(WORKSPACE_ROOT):
+        if not resolved.is_relative_to(root):
             continue
 
         relative_path = item.relative_to(
-            WORKSPACE_ROOT
+            root
         ).as_posix()
 
         if item.is_file():
@@ -122,6 +130,7 @@ def get_workspace_inventory():
             directories.append(relative_path + "/")
 
     return sorted(files), sorted(directories)
+
 
 
 def invalid_proposal(
@@ -143,11 +152,103 @@ def invalid_proposal(
     )
 
 
+
 def validate_proposal(
     proposal: ActionProposal,
     available_files: list[str],
     available_directories: list[str],
+    workspace_root: Path | None = None,
 ) -> ActionProposal:
+    """
+    Validate a proposed file operation against the selected workspace.
+    """
+
+    root = Path(
+        workspace_root if workspace_root is not None
+        else WORKSPACE_ROOT
+    ).resolve()
+
+    if proposal.needs_clarification:
+        return proposal
+
+    if proposal.tool == "unsupported":
+        return proposal
+
+    # Source must match an actual file in this workspace.
+    if proposal.source_path not in available_files:
+        return invalid_proposal(
+            proposal,
+            "The suggested source file does not exist in the workspace. "
+            "Please specify an available file.",
+        )
+
+    destination = proposal.destination_path.strip()
+
+    if not destination:
+        return invalid_proposal(
+            proposal,
+            "Please specify a destination.",
+        )
+
+    destination_object = Path(destination)
+
+    if (
+        destination_object.is_absolute()
+        or ".." in destination_object.parts
+    ):
+        return invalid_proposal(
+            proposal,
+            "The destination path is not allowed.",
+        )
+
+    # Destination folder must already exist.
+    if destination.endswith(("/", "\\")):
+        normalized_folder = (
+            destination.replace("\\", "/").rstrip("/") + "/"
+        )
+
+        if normalized_folder not in available_directories:
+            return invalid_proposal(
+                proposal,
+                "The destination folder does not exist in the workspace.",
+            )
+
+        return proposal
+
+    # Destination parent must exist.
+    parent_folder = destination_object.parent.as_posix()
+
+    if parent_folder == ".":
+        parent_folder = ""
+
+    normalized_parent = (
+        parent_folder + "/" if parent_folder else ""
+    )
+
+    if normalized_parent and normalized_parent not in available_directories:
+        return invalid_proposal(
+            proposal,
+            "The destination's parent folder does not exist.",
+        )
+
+    destination_path = (
+        root / destination_object
+    ).resolve()
+
+    if not destination_path.is_relative_to(root):
+        return invalid_proposal(
+            proposal,
+            "The destination is outside the workspace.",
+        )
+
+    if destination_path.exists():
+        return invalid_proposal(
+            proposal,
+            "A file or folder already exists at the destination.",
+        )
+
+    return proposal
+
     """
     Check that Gemini selected a real source file
     and a valid destination inside the workspace.
@@ -236,12 +337,14 @@ def validate_proposal(
     return proposal
 
 
+
 def generate_action_proposal(
     user_instruction: str,
+    workspace_root: Path | None = None,
 ) -> ActionProposal:
     """
-    Ask Gemini to interpret a user instruction
-    and create a validated file-operation proposal.
+    Ask Gemini to interpret a user instruction and create
+    a validated proposal inside the selected workspace.
 
     This function never executes file operations.
     """
@@ -268,9 +371,20 @@ def generate_action_proposal(
             "GEMINI_API_KEY is missing. Check backend/.env."
         )
 
-    # Read the real workspace contents.
+    # Select the authenticated user's workspace.
+    root = Path(
+        workspace_root if workspace_root is not None
+        else WORKSPACE_ROOT
+    ).resolve()
+
+    if not root.is_dir():
+        raise RuntimeError(
+            "The selected agent workspace does not exist."
+        )
+
+    # Read only files belonging to this workspace.
     available_files, available_directories = (
-        get_workspace_inventory()
+        get_workspace_inventory(root)
     )
 
     workspace_information = f"""
@@ -306,9 +420,10 @@ AVAILABLE WORKSPACE FOLDERS:
         response.text
     )
 
-    # Independently validate the AI's suggested paths.
+    # Validate against the same user's workspace.
     return validate_proposal(
         proposal,
         available_files,
         available_directories,
+        workspace_root=root,
     )

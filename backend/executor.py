@@ -1,24 +1,31 @@
 
 import shutil
+from pathlib import Path
 
-from workspace_paths import WORKSPACE_ROOT, resolve_workspace_path
-
-
-
-
-
-
+from workspace_paths import (
+    WORKSPACE_ROOT,
+    resolve_workspace_path,
+)
 
 
-def execute_file_action(tool: str, target: str) -> dict:
+def execute_file_action(
+    tool: str,
+    target: str,
+    workspace_root: Path | None = None,
+) -> dict:
     """
-    Revalidate and execute an approved file operation.
+    Revalidate and execute an approved file operation
+    inside the selected user's workspace.
 
-    Supported operations:
-    - copy_file
-    - move_file
-    - rename_file
+    When workspace_root is omitted, the legacy workspace
+    is retained for existing tests and local compatibility.
     """
+
+    # Select the appropriate workspace.
+    root = Path(
+        workspace_root if workspace_root is not None
+        else WORKSPACE_ROOT
+    ).resolve()
 
     # Check supported operations.
     if tool not in {
@@ -43,11 +50,12 @@ def execute_file_action(tool: str, target: str) -> dict:
             "Both source and destination paths are required."
         )
 
-    # Validate the source again at execution time.
+    # Validate the source inside the selected workspace.
     try:
         source_path = resolve_workspace_path(
             source_text,
             must_exist=True,
+            workspace_root=root,
         )
     except FileNotFoundError as error:
         raise ValueError(
@@ -59,10 +67,11 @@ def execute_file_action(tool: str, target: str) -> dict:
             "The source must be an existing file."
         )
 
-    # Validate the destination again.
+    # Validate the destination inside the selected workspace.
     destination_path = resolve_workspace_path(
         destination_text,
         must_exist=False,
+        workspace_root=root,
     )
 
     destination_is_folder = (
@@ -94,7 +103,7 @@ def execute_file_action(tool: str, target: str) -> dict:
     # Resolve the final destination after adding the filename.
     destination_path = destination_path.resolve()
 
-    if not destination_path.is_relative_to(WORKSPACE_ROOT):
+    if not destination_path.is_relative_to(root):
         raise ValueError(
             "Destination outside the workspace is not allowed."
         )
@@ -139,7 +148,7 @@ def execute_file_action(tool: str, target: str) -> dict:
         "tool": tool,
         "source": source_text,
         "destination": destination_path.relative_to(
-            WORKSPACE_ROOT
+            root
         ).as_posix(),
         "message": "File operation completed successfully.",
     }

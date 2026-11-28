@@ -35,3 +35,8 @@ Thumbs.db
 *.sqlite3
 
 backend/agent_workspace/
+
+.env.local
+
+# Database backups
+*.db.backup-*

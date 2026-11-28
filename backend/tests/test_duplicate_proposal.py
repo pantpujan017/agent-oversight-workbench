@@ -55,22 +55,40 @@ def test_duplicate_proposal_is_not_added_twice(
     monkeypatch.setattr(
         main,
         "generate_action_proposal",
-        lambda instruction: proposal,
+        lambda instruction, workspace_root=None: proposal
     )
+
+    
 
     request = main.ProposalRequest(
         instruction="Copy plan.txt into review as duplicate_test.txt."
     )
 
+    test_user = {
+    "id": "test-user-123"
+}
+
+    monkeypatch.setattr(
+    main,
+    "get_user_workspace_root",
+    lambda user_id: tmp_path,
+)
+
     # Submit the first proposal.
-    first_result = main.create_proposal(request)
+    first_result = main.create_proposal(
+    request,
+    current_user=test_user,
+)
 
     assert first_result["status"] == "pending_approval"
 
     first_action_id = first_result["action"]["id"]
 
     # Submit exactly the same proposal again.
-    second_result = main.create_proposal(request)
+    second_result = main.create_proposal(
+    request,
+    current_user=test_user,
+)
 
     assert second_result["status"] == "duplicate"
 
